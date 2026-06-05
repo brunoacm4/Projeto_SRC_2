@@ -207,7 +207,7 @@ def plot_new_country_flows(results, bl):
     fig, ax = plt.subplots(figsize=(8.6, 4.5))
     ax.barh(totals["src_ip"], totals["flows"], color=colors)
     ax.axvline(bl["country_flow_high_thr"], color=RED, linestyle="--", linewidth=1)
-    ax.set_xlabel("flows to countries unseen in training")
+    ax.set_xlabel("flows to destinations (country or owner) unseen in training")
     ax.set_ylabel("source IP")
     ax.set_title("Anomalous external destinations by source")
     ax.text(

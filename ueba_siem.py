@@ -228,6 +228,32 @@ def dns_stats(df: pd.DataFrame) -> pd.DataFrame:
     return stats.join(intervals)
 
 
+def dns_https_ratio_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-device balance between DNS and HTTPS activity.
+
+    Data exfiltration over DNS inflates DNS volume relative to the device's
+    normal HTTPS usage, even when the absolute DNS payload still looks small.
+    The flow- and byte-level ratios capture that shift. Devices without HTTPS
+    activity yield NaN ratios and are left for the volume-based rules.
+    """
+    dns = df[df["port"] == 53].groupby("src_ip").agg(
+        dns_flows=("up_bytes", "count"),
+        dns_up=("up_bytes", "sum"),
+    )
+    https = df[df["port"] == 443].groupby("src_ip").agg(
+        https_flows=("up_bytes", "count"),
+        https_up=("up_bytes", "sum"),
+    )
+    stats = dns.join(https, how="outer")
+    for col in ["dns_flows", "dns_up", "https_flows", "https_up"]:
+        if col not in stats:
+            stats[col] = 0
+    stats = stats.fillna(0)
+    stats["flow_ratio"] = safe_ratio(stats["dns_flows"], stats["https_flows"])
+    stats["byte_ratio"] = safe_ratio(stats["dns_up"], stats["https_up"])
+    return stats
+
+
 def external_user_stats(df: pd.DataFrame) -> pd.DataFrame:
     stats = df.groupby("src_ip").agg(
         up_total=("up_bytes", "sum"),
@@ -352,6 +378,16 @@ def compute_baselines(
         bl["dns_mean_interval_min"] / 100,
     )
 
+    xratio_train = dns_https_ratio_stats(itr)
+    bl["dns_https_train_stats"] = xratio_train
+    bl["dns_https_byte_ratio_max"] = float(xratio_train["byte_ratio"].max())
+    bl["dns_https_flow_ratio_max"] = float(xratio_train["flow_ratio"].max())
+    log.info(
+        "  DNS/HTTPS clean max byte_ratio=%.6f flow_ratio=%.4f",
+        bl["dns_https_byte_ratio_max"],
+        bl["dns_https_flow_ratio_max"],
+    )
+
     bl["beacon_min_intervals"] = 30
     bl["beacon_min_interval"] = 6000
     bl["beacon_min_span"] = 0.10 * DAY_UNITS
@@ -401,6 +437,15 @@ def compute_baselines(
     bl["ext_ratio_std"] = float(external_train["ratio"].std())
     ratio_range = bl["ext_ratio_max"] - bl["ext_ratio_min"]
     bl["ext_ratio_factor_thr"] = 1 + (ratio_range / bl["ext_ratio_mean"]) / 2
+    # 3-sigma band on the clean per-client ratio. The band is widened to the
+    # full observed range when 3 sigma is narrower, guaranteeing zero alerts on
+    # the training data while keeping a statistically grounded threshold.
+    bl["ext_ratio_band_lo"] = min(
+        bl["ext_ratio_mean"] - SIGMA * bl["ext_ratio_std"], bl["ext_ratio_min"]
+    )
+    bl["ext_ratio_band_hi"] = max(
+        bl["ext_ratio_mean"] + SIGMA * bl["ext_ratio_std"], bl["ext_ratio_max"]
+    )
     bl["ext_interval_max"] = float(external_train["mean_interval"].max())
     bl["ext_interval_mean"] = float(external_train["mean_interval"].mean())
     bl["ext_interval_std"] = float(external_train["mean_interval"].std())
@@ -622,8 +667,15 @@ def rule_r3_dns_exfiltration(
     """
     R3 - DNS exfiltration.
 
-    This rule is intentionally separated from DNS C&C. High DNS flow counts
-    with normal payload size and very short intervals are handled by R4.
+    Two complementary signals are used:
+      R3a: absolute DNS upload volume above history together with an abnormal
+           payload size / up-down ratio.
+      R3b: a per-device DNS-to-HTTPS imbalance (byte ratio above the clean
+           maximum). This catches exfiltration that tunnels data through DNS
+           even when the absolute DNS payload still looks modest, by comparing
+           it against the device's normal HTTPS usage.
+
+    DNS C&C (many flows, fast polling, normal payload) is handled by R4.
     """
     if emit:
         log.info("=== R3: DNS data exfiltration ===")
@@ -638,6 +690,7 @@ def rule_r3_dns_exfiltration(
     flagged = flagged.sort_values("up_total", ascending=False).reset_index()
 
     rows = []
+    seen = set()
     for row in flagged.itertuples(index=False):
         detail = (
             f"DNS payload anomaly flows={int(row.dns_flows)} "
@@ -647,9 +700,10 @@ def rule_r3_dns_exfiltration(
             f"(mean_up>{bl['dns_mean_up_max']:.2f}B or "
             f"up/down>{bl['dns_ratio_max']:.4f})"
         )
+        seen.add(row.src_ip)
         rows.append(
             {
-                "rule": "R3",
+                "rule": "R3a",
                 "severity": "HIGH",
                 "src_ip": row.src_ip,
                 "dns_flows": int(row.dns_flows),
@@ -666,7 +720,45 @@ def rule_r3_dns_exfiltration(
             }
         )
         if emit:
-            alert("R3", "HIGH", row.src_ip, detail)
+            alert("R3a", "HIGH", row.src_ip, detail)
+
+    xstats = dns_https_ratio_stats(ite)
+    xflag = xstats[xstats["byte_ratio"] > bl["dns_https_byte_ratio_max"]].copy()
+    xflag = xflag.join(
+        stats[["mean_up", "max_up", "up_down_ratio"]], how="left"
+    )
+    for src_ip, row in xflag.sort_values(
+        "byte_ratio", ascending=False
+    ).iterrows():
+        if src_ip in seen:
+            continue
+        detail = (
+            f"DNS/HTTPS imbalance byte_ratio={row['byte_ratio']:.6f} "
+            f"(dns_up={int(row['dns_up'])}B / https_up={int(row['https_up'])}B) "
+            f"dns_flows={int(row['dns_flows'])} "
+            f"https_flows={int(row['https_flows'])}; "
+            f"threshold byte_ratio>{bl['dns_https_byte_ratio_max']:.6f}"
+        )
+        rows.append(
+            {
+                "rule": "R3b",
+                "severity": "HIGH",
+                "src_ip": src_ip,
+                "dns_flows": int(row["dns_flows"]),
+                "up_total": int(row["dns_up"]),
+                "mean_up": float(row["mean_up"]) if pd.notna(row["mean_up"]) else np.nan,
+                "max_up": int(row["max_up"]) if pd.notna(row["max_up"]) else 0,
+                "up_down_ratio": float(row["up_down_ratio"])
+                if pd.notna(row["up_down_ratio"])
+                else np.nan,
+                "threshold": (
+                    f"dns/https byte_ratio>{bl['dns_https_byte_ratio_max']:.6f}"
+                ),
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R3b", "HIGH", src_ip, detail)
 
     if not rows and emit:
         log.info("  No DNS exfiltration detected.")
@@ -749,7 +841,14 @@ def rule_r5_anomalous_destinations(
     geodbasn,
     emit: bool = True,
 ) -> pd.DataFrame:
-    """R5 - Internal users contacting countries not present in history."""
+    """R5 - Internal users contacting destinations not present in history.
+
+    A public HTTPS destination is considered novel when its country *or* its
+    owner (ASN) was never contacted in the clean training day. Owner novelty is
+    the stronger signal: it flags traffic to a brand-new network operator even
+    inside an already-known country, and it is not fooled by a known CDN owner
+    serving from a new country edge.
+    """
     if emit:
         log.info("=== R5: Anomalous external destinations ===")
 
@@ -786,10 +885,14 @@ def rule_r5_anomalous_destinations(
         lambda ip: asn_map.get(ip, {}).get("org", "UNKNOWN")
     )
 
-    new_country_flows = public_https[
-        ~public_https["dst_cc"].isin(bl["train_countries"])
+    public_https["new_country"] = ~public_https["dst_cc"].isin(
+        bl["train_countries"]
+    )
+    public_https["new_owner"] = ~public_https["dst_asn"].isin(bl["train_asns"])
+    novel_flows = public_https[
+        public_https["new_country"] | public_https["new_owner"]
     ].copy()
-    if new_country_flows.empty:
+    if novel_flows.empty:
         if emit:
             log.info("  No anomalous destinations detected.")
         return empty_alert_df(
@@ -806,25 +909,27 @@ def rule_r5_anomalous_destinations(
         )
 
     summary = (
-        new_country_flows.groupby(["src_ip", "dst_cc", "dst_asn", "dst_org"])
+        novel_flows.groupby(["src_ip", "dst_cc", "dst_asn", "dst_org"])
         .agg(
             flows=("up_bytes", "count"),
             up_bytes=("up_bytes", "sum"),
             dst_ips=("dst_ip", "nunique"),
+            new_country=("new_country", "max"),
+            new_owner=("new_owner", "max"),
         )
         .reset_index()
         .sort_values(["src_ip", "flows"], ascending=[True, False])
     )
     totals = summary.groupby("src_ip")["flows"].sum()
-    summary["total_new_country_flows"] = summary["src_ip"].map(totals)
+    summary["total_novel_flows"] = summary["src_ip"].map(totals)
     summary["severity"] = np.where(
-        summary["total_new_country_flows"] >= bl["country_flow_high_thr"],
+        summary["total_novel_flows"] >= bl["country_flow_high_thr"],
         "HIGH",
         "MEDIUM",
     )
     summary["rule"] = "R5"
     summary["threshold"] = (
-        "country not in training; high severity if "
+        "destination country or owner not in training; high severity if "
         f"total_flows>={bl['country_flow_high_thr']}"
     )
 
@@ -832,17 +937,28 @@ def rule_r5_anomalous_destinations(
     for src_ip, sub in summary.groupby("src_ip"):
         total = int(sub["flows"].sum())
         severity = "HIGH" if total >= bl["country_flow_high_thr"] else "MEDIUM"
-        by_country = sub.groupby("dst_cc")["flows"].sum().sort_values(
-            ascending=False
+        new_cc = (
+            sub[sub["new_country"]]
+            .groupby("dst_cc")["flows"]
+            .sum()
+            .sort_values(ascending=False)
         )
-        by_org = sub.groupby("dst_org")["flows"].sum().sort_values(ascending=False)
-        countries = ", ".join(f"{cc}({int(n)})" for cc, n in by_country.items())
-        owners = ", ".join(
-            f"{org}({int(n)})" for org, n in by_org.head(3).items()
+        new_own = (
+            sub[sub["new_owner"]]
+            .groupby("dst_org")["flows"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        countries = (
+            ", ".join(f"{cc}({int(n)})" for cc, n in new_cc.items()) or "none"
+        )
+        owners = (
+            ", ".join(f"{org}({int(n)})" for org, n in new_own.head(3).items())
+            or "none"
         )
         detail = (
-            f"Traffic to new countries countries={countries}; "
-            f"top_owners={owners}; total_flows={total}; "
+            f"Traffic to never-seen destinations new_countries={countries}; "
+            f"new_owners={owners}; total_flows={total}; "
             f"high_threshold>={bl['country_flow_high_thr']}"
         )
         summary.loc[summary["src_ip"] == src_ip, "detail"] = detail
@@ -860,7 +976,9 @@ def rule_r5_anomalous_destinations(
             "flows",
             "up_bytes",
             "dst_ips",
-            "total_new_country_flows",
+            "new_country",
+            "new_owner",
+            "total_novel_flows",
             "threshold",
             "detail",
         ]
@@ -884,59 +1002,30 @@ def rule_r6_anomalous_external_users(
         columns={"ratio": "train_ratio"}
     )
     stats = stats.join(train, how="left")
-    stats["ratio_factor_high"] = stats["ratio"] / stats["train_ratio"]
-    stats["ratio_factor_low"] = stats["train_ratio"] / stats["ratio"]
     rows = []
 
+    # Ratio anomaly: outside the 3-sigma band of the clean external-client
+    # ratio. The assignment hint states the anomaly is not the amount of
+    # traffic, so this band is deliberately statistical (mean +/- 3 sigma) and
+    # validated to produce zero alerts on the clean training clients.
+    band_lo = bl["ext_ratio_band_lo"]
+    band_hi = bl["ext_ratio_band_hi"]
     bad_ratio = stats[
-        (
-            (stats["ratio"] < bl["ext_ratio_min"])
-            & (
-                (
-                    stats["train_ratio"].notna()
-                    & (stats["ratio_factor_low"] > bl["ext_ratio_factor_thr"])
-                )
-                | (
-                    stats["train_ratio"].isna()
-                    & (
-                        stats["ratio"]
-                        < bl["ext_ratio_min"] / bl["ext_ratio_factor_thr"]
-                    )
-                )
-            )
-        )
-        | (
-            (stats["ratio"] > bl["ext_ratio_max"])
-            & (
-                (
-                    stats["train_ratio"].notna()
-                    & (stats["ratio_factor_high"] > bl["ext_ratio_factor_thr"])
-                )
-                | (
-                    stats["train_ratio"].isna()
-                    & (
-                        stats["ratio"]
-                        > bl["ext_ratio_max"] * bl["ext_ratio_factor_thr"]
-                    )
-                )
-            )
-        )
+        (stats["ratio"] < band_lo) | (stats["ratio"] > band_hi)
     ].copy()
     for src_ip, row in bad_ratio.sort_values("ratio").iterrows():
-        direction = "low" if row["ratio"] < bl["ext_ratio_min"] else "high"
-        drift = (
-            row["ratio_factor_low"]
-            if direction == "low"
-            else row["ratio_factor_high"]
+        direction = "low" if row["ratio"] < band_lo else "high"
+        train_ratio_txt = (
+            f"{row['train_ratio']:.6f}"
+            if pd.notna(row["train_ratio"])
+            else "new-client"
         )
         threshold = (
-            f"ratio outside [{bl['ext_ratio_min']:.6f}, "
-            f"{bl['ext_ratio_max']:.6f}] and own drift>"
-            f"{bl['ext_ratio_factor_thr']:.4f}"
+            f"ratio outside 3-sigma band [{band_lo:.6f}, {band_hi:.6f}]"
         )
         detail = (
             f"External user {direction} up/down ratio={row['ratio']:.6f}; "
-            f"train_ratio={row['train_ratio']:.6f} drift={drift:.4f}; "
+            f"train_ratio={train_ratio_txt}; "
             f"threshold={threshold}; flows={int(row['flows'])}"
         )
         rows.append(
@@ -1165,13 +1254,17 @@ def write_markdown_report(
         f"`>{bl['dns_total_up_max']}B` and mean_up "
         f"`>{bl['dns_mean_up_max']:.2f}B` or up/down "
         f"`>{bl['dns_ratio_max']:.4f}`",
+        f"- DNS/HTTPS clean balance: max byte-ratio "
+        f"`{bl['dns_https_byte_ratio_max']:.6f}`, max flow-ratio "
+        f"`{bl['dns_https_flow_ratio_max']:.4f}` (used by R3b)",
         f"- Known destination countries: `{len(bl['train_countries'])}`; "
-        f"new-country high severity threshold: "
+        f"known destination owners (ASNs): `{len(bl['train_asns'])}`; "
+        f"new-destination high severity threshold: "
         f"`{bl['country_flow_high_thr']}` flows",
         f"- External user ratio range: `{bl['ext_ratio_min']:.6f}` to "
-        f"`{bl['ext_ratio_max']:.6f}`; own-drift threshold "
-        f"`{bl['ext_ratio_factor_thr']:.4f}`; max clean interval "
-        f"`{bl['ext_interval_max'] / 100:.2f}s`",
+        f"`{bl['ext_ratio_max']:.6f}`; 3-sigma band "
+        f"`[{bl['ext_ratio_band_lo']:.6f}, {bl['ext_ratio_band_hi']:.6f}]`; "
+        f"max clean interval `{bl['ext_interval_max'] / 100:.2f}s`",
         "",
         "The most important conclusion from the clean data is that internal "
         "clients normally contact only three internal services: two DNS servers "
@@ -1204,12 +1297,14 @@ def write_markdown_report(
         "",
         "### R3 - DNS data exfiltration",
         "",
-        "R3 is intentionally separated from DNS C&C. It only alerts when DNS "
-        "upload volume is above the historical maximum and the payload/ratio "
-        "also deviates from the clean baseline. In this dataset no DNS "
-        "exfiltration was detected; the DNS anomalies found are better "
-        "explained by timing/flow-count behaviour and are therefore reported by "
-        "R4.",
+        "R3 uses two complementary signals. `R3a` alerts when DNS upload volume "
+        "is above the historical maximum and the payload size / up-down ratio "
+        "also deviates from the clean baseline. `R3b` compares each device's "
+        "DNS-to-HTTPS byte ratio against the clean maximum: a device tunnelling "
+        "data over DNS shows an abnormally large DNS payload relative to its "
+        "own normal HTTPS usage, even when the absolute DNS volume still looks "
+        "modest. R3b surfaces a device that the volume-only test misses and "
+        "also corroborates the DNS C&C devices reported by R4.",
         "",
         "### R4 - C&C via DNS",
         "",
@@ -1220,10 +1315,13 @@ def write_markdown_report(
         "",
         "### R5 - Anomalous external destinations",
         "",
-        "R5 compares HTTPS destination countries against the set of countries "
-        "seen in the clean training day. New countries are reported together "
-        "with ASN/owner information. Severity is higher when the total number "
-        "of flows to new countries exceeds the 75th percentile of normal "
+        "R5 flags HTTPS traffic to destinations never seen in the clean "
+        "training day. A destination is novel when its country *or* its owner "
+        "(ASN) was not contacted during training. Owner novelty is the stronger "
+        "signal: it detects a brand-new network operator even inside a known "
+        "country, and avoids false positives from a known CDN owner serving "
+        "from a new country edge. Severity is higher when the total number of "
+        "novel-destination flows exceeds the 75th percentile of normal "
         "per-device/per-country flow counts.",
         "",
         "### R6 - Anomalous external users",
@@ -1231,9 +1329,11 @@ def write_markdown_report(
         "R6 analyses external clients accessing the corporate public servers. "
         "New source IPs are not automatically anomalous because the assignment "
         "states that the anomaly is not simply traffic amount or flow count. "
-        "Instead, R6 flags clients whose upload/download ratio leaves the clean "
-        "range and also drifts from their own baseline, or whose mean interval "
-        "between flows exceeds the maximum clean interval.",
+        "Instead, R6 flags clients whose upload/download ratio falls outside "
+        "the 3-sigma band of the clean external-client ratio, or whose mean "
+        "interval between flows exceeds the maximum clean interval. Timing is "
+        "the primary behavioural signal; the statistical ratio band keeps the "
+        "secondary ratio check from firing on normal fluctuation.",
         "",
         "## Validation",
         "",

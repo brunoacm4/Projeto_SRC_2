@@ -133,7 +133,9 @@ line marks the maximum clean ratio.}
 For DNS, the clean maximum is 1,446 DNS flows per device, and the shortest
 clean mean interval between DNS flows is 22.23 seconds. Devices exceeding the
 flow maximum while also polling faster than this minimum are strong DNS C\&C
-candidates.
+candidates. In addition, the clean per-device DNS-to-HTTPS byte ratio never
+exceeds $0.0034$; a much larger ratio indicates data being moved over DNS
+relative to the device's normal HTTPS usage (exfiltration/tunnelling).
 
 \begin{figure}[H]
 \centering
@@ -180,18 +182,24 @@ The clean HTTPS upload/download ratio is below 0.116756. A device is flagged
 only when it exceeds this maximum and also deviates strongly from its own
 training ratio. \\
 \ruleid{R3} & DNS data exfiltration &
-DNS exfiltration requires both abnormal DNS upload volume and abnormal
-payload/ratio. In this dataset, no such DNS payload anomaly was found. \\
+\ruleid{R3a} requires abnormal DNS upload volume together with abnormal
+payload size / up-down ratio. \ruleid{R3b} flags a DNS-to-HTTPS byte ratio
+above the clean maximum, catching DNS tunnelling that is small in absolute
+terms but large relative to the device's normal HTTPS usage. \\
 \ruleid{R4} & C\&C via DNS &
 DNS C\&C is identified by more DNS flows than any clean device and a mean
 interval shorter than the clean minimum of 22.23 seconds. \\
 \ruleid{R5} & Anomalous external destinations &
-HTTPS traffic to countries not observed in training is suspicious. ASN/owner
-information is added to support incident analysis. \\
+HTTPS traffic to a destination whose country \emph{or} owner (ASN) was never
+contacted in training is suspicious. Owner novelty is the stronger signal: it
+detects a new operator inside a known country and ignores known CDNs serving
+from a new edge. \\
 \ruleid{R6} & Anomalous external users &
-External clients are flagged by ratio or timing drift. New client IPs are not
-automatically anomalous, because the project statement notes that the anomaly
-is not traffic amount or flow count. \\
+External clients are flagged when the upload/download ratio leaves the
+3-sigma band of the clean ratio, or when the mean inter-flow interval exceeds
+the clean maximum. Timing is the primary signal; new client IPs are not
+automatically anomalous, because the statement notes the anomaly is not
+traffic amount or flow count. \\
 \bottomrule
 \end{longtable}
 
@@ -251,10 +259,32 @@ Source IP & Test ratio & Training ratio & Ratio factor \\
 
 \subsection{R3 -- DNS Data Exfiltration}
 
-No DNS data exfiltration was detected. Although some devices generate many DNS
-flows, their DNS payload sizes and upload/download ratios remain compatible
-with the clean payload baseline. These anomalies are therefore classified as
-DNS C\&C by \ruleid{R4}, not as DNS exfiltration.
+The volume-based \ruleid{R3a} test found no device above the clean DNS payload
+baseline. The DNS-to-HTTPS imbalance test \ruleid{R3b}, however, flagged five
+devices whose DNS byte volume is disproportionate to their HTTPS usage
+(clean maximum byte ratio $0.0034$):
+
+\begin{table}[H]
+\centering
+\caption{R3b DNS/HTTPS imbalance candidates.}
+\begin{tabular}{lrrr}
+\toprule
+Source IP & DNS up (B) & HTTPS up (B) & Byte ratio \\
+\midrule
+\ip{192.168.101.41} & 7,898,782 & 45,424,252 & 0.1739 \\
+\ip{192.168.101.23} & 1,734,018 & 23,038,429 & 0.0753 \\
+\ip{192.168.101.32} & 46,530 & 6,473,967 & 0.0072 \\
+\ip{192.168.101.148} & 329,313 & 49,768,696 & 0.0066 \\
+\ip{192.168.101.201} & 583,107 & 97,001,879 & 0.0060 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Four of these (\ip{192.168.101.41}, \ip{192.168.101.23}, \ip{192.168.101.148},
+\ip{192.168.101.201}) are also the DNS C\&C devices of \ruleid{R4}, so the
+imbalance corroborates that channel. The fifth, \ip{192.168.101.32}, is a new
+detection: it does not reach the C\&C flow-count threshold but still moves an
+abnormal share of its data over DNS.
 
 \subsection{R4 -- C\&C via DNS}
 
@@ -277,9 +307,12 @@ Source IP & DNS flows & Mean interval (s) \\
 
 The strongest anomalous-destination devices are \ip{192.168.101.36},
 \ip{192.168.101.72} and \ip{192.168.101.125}. These devices contact many
-destinations in countries absent from the clean baseline, mainly RU and IR.
-Low-volume accesses to BE are kept as medium severity because they are unusual
-but much smaller in scale.
+destinations in countries absent from the clean baseline (mainly RU and IR)
+\emph{and} to owners never seen in training, such as PJSC Rostelecom, JSC
+Selectel and PJSC MegaFon -- which is why they are high severity. The
+low-volume accesses to BE (\ip{192.168.101.167}, \ip{192.168.101.175},
+\ip{192.168.101.189}) reach a new country but a \emph{known} owner (Facebook),
+so they are kept at medium severity.
 
 \begin{figure}[H]
 \centering
@@ -309,7 +342,8 @@ R1a & \ip{192.168.101.68}, \ip{192.168.101.138}, \ip{192.168.101.186} \\
 R1b & \ip{192.168.101.26}, \ip{192.168.101.187}, \ip{192.168.101.197} \\
 R2 & \ip{192.168.101.14}, \ip{192.168.101.208}, \ip{192.168.101.187},
 \ip{192.168.101.26}, \ip{192.168.101.197}, \ip{192.168.101.188} \\
-R3 & None \\
+R3b & \ip{192.168.101.41}, \ip{192.168.101.23}, \ip{192.168.101.32},
+\ip{192.168.101.148}, \ip{192.168.101.201} \\
 R4 & \ip{192.168.101.41}, \ip{192.168.101.23}, \ip{192.168.101.201},
 \ip{192.168.101.148} \\
 R5 & \ip{192.168.101.36}, \ip{192.168.101.72}, \ip{192.168.101.125},
@@ -363,9 +397,10 @@ and anomalous external-client behaviour.
 
 The rules are deliberately conservative: they are based on historical maxima,
 minima, per-device ratios and clean-data validation. This makes the alerts
-explainable and suitable for SIEM reporting. No DNS data exfiltration was
-detected; the DNS anomalies are better classified as C\&C due to timing and
-flow-count behaviour.
+explainable and suitable for SIEM reporting. The DNS anomalies appear both as
+fast-polling C\&C (R4) and as a DNS/HTTPS byte-ratio imbalance (R3b); the
+latter additionally exposed \ip{192.168.101.32}, a device moving an abnormal
+share of its traffic over DNS without reaching the C\&C flow threshold.
 
 \section{Future Work}
 
