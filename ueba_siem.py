@@ -1,67 +1,46 @@
 #!/usr/bin/env python3
 """
-UEBA Module for SIEM - Security in Communications Networks
-Dataset: 1  (X = 1)
+UEBA module for SIEM - Security in Communications Networks
+Dataset: 1 (X = 1)
 
-Rules implemented:
-  R1 - Internal BotNet detection (beaconing: very regular per-src/dst intervals)
-  R2 - Data exfiltration via HTTPS (abnormally high upload/download ratio)
-  R3 - Data exfiltration via DNS   (abnormally high DNS flow volume / large payloads)
-  R4 - C&C activities via DNS      (high-frequency DNS polling)
-  R5 - Anomalous external destinations (traffic to countries not in baseline)
-  R6 - Anomalous external users    (unknown src IPs / abnormal up-down ratio / long idle intervals)
+The training files are treated as anomaly-free history. Every detection rule
+therefore uses thresholds derived from those files and must produce zero
+alerts when applied back to the training data.
 """
 
-import sys
+import argparse
+from collections import Counter
+import ipaddress
 import logging
 import logging.handlers
-import ipaddress
-from datetime import datetime
+from pathlib import Path
+import sys
+from datetime import datetime, timezone
 
-import pandas as pd
-import numpy as np
 import geoip2.database
+import numpy as np
+import pandas as pd
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATASET_DIR   = "dataset1"
+DATASET_DIR = "dataset1"
 GEODB_COUNTRY = "Geo-Localization Databases-20260516/dbip-country-lite-2026-05.mmdb"
-GEODB_ASN     = "Geo-Localization Databases-20260516/dbip-asn-lite-2026-05.mmdb"
+GEODB_ASN = "Geo-Localization Databases-20260516/dbip-asn-lite-2026-05.mmdb"
 
 INTERNAL_TRAIN = f"{DATASET_DIR}/internal_train1.json"
-INTERNAL_TEST  = f"{DATASET_DIR}/internal_test1.json"
+INTERNAL_TEST = f"{DATASET_DIR}/internal_test1.json"
 EXTERNAL_TRAIN = f"{DATASET_DIR}/external_train1.json"
-EXTERNAL_TEST  = f"{DATASET_DIR}/external_test1.json"
+EXTERNAL_TEST = f"{DATASET_DIR}/external_test1.json"
 
-# Network definitions (discovered from data)
-INTERNAL_NET   = ipaddress.IPv4Network("192.168.101.0/24")
-CORPORATE_SRVS = {"200.0.0.11", "200.0.0.12"}
-
-# Internal servers (identified from training data)
-DNS_SERVERS    = {"192.168.101.226", "192.168.101.229"}
-HTTPS_SERVER   = "192.168.101.240"
-
-# Sigma multiplier for anomaly thresholds
 SIGMA = 3
+DAY_UNITS = 86400 * 100
+
 
 # ---------------------------------------------------------------------------
-# Syslog / reporting setup
+# Logging / SIEM reporting
 # ---------------------------------------------------------------------------
-syslog_handler = None
-try:
-    syslog_handler = logging.handlers.SysLogHandler(address="/dev/log")
-    syslog_handler.setFormatter(
-        logging.Formatter("UEBA-SIEM %(levelname)s: %(message)s"))
-    syslog_logger = logging.getLogger("ueba_siem")
-    syslog_logger.setLevel(logging.WARNING)
-    syslog_logger.addHandler(syslog_handler)
-    syslog_logger.propagate = False   # prevent double-logging to root
-    SYSLOG_AVAILABLE = True
-except Exception:
-    SYSLOG_AVAILABLE = False
-
-# Console logger for all output
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -69,26 +48,112 @@ logging.basicConfig(
 )
 log = logging.getLogger("ueba_console")
 
+syslog_logger = logging.getLogger("ueba_siem_syslog")
+syslog_logger.setLevel(logging.WARNING)
+syslog_logger.propagate = False
+SYSLOG_TARGETS = []
 
-def alert(rule_id: str, severity: str, src_ip: str, detail: str):
-    """Emit an alert to console and (if available) to rsyslog."""
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    msg = f"[{ts}] ALERT rule={rule_id} severity={severity} src_ip={src_ip} | {detail}"
-    if severity == "HIGH":
-        log.warning(msg)
+
+class QuietSysLogHandler(logging.handlers.SysLogHandler):
+    """Syslog handler that keeps console output clean if syslog is unavailable."""
+
+    def handleError(self, record):
+        return
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def configure_syslog(
+    syslog_host: str | None = None,
+    syslog_port: int = 514,
+    enable_local: bool = True,
+) -> None:
+    """Configure optional local and remote syslog alert forwarding."""
+    global SYSLOG_TARGETS
+
+    for handler in list(syslog_logger.handlers):
+        syslog_logger.removeHandler(handler)
+        handler.close()
+    SYSLOG_TARGETS = []
+
+    formatter = logging.Formatter("%(message)s")
+
+    if enable_local:
+        if Path("/dev/log").exists():
+            try:
+                handler = QuietSysLogHandler(address="/dev/log")
+                handler.setFormatter(formatter)
+                syslog_logger.addHandler(handler)
+                SYSLOG_TARGETS.append("/dev/log")
+            except Exception:
+                log.info("Local syslog unavailable; continuing with console output.")
+        else:
+            log.info("Local syslog unavailable; continuing with console output.")
+
+    if syslog_host:
+        try:
+            handler = QuietSysLogHandler(
+                address=(syslog_host, int(syslog_port))
+            )
+            handler.setFormatter(formatter)
+            syslog_logger.addHandler(handler)
+            SYSLOG_TARGETS.append(f"{syslog_host}:{syslog_port}")
+        except Exception as exc:
+            log.warning("Could not configure remote syslog: %s", exc)
+
+
+def alert(rule_id: str, severity: str, src_ip: str, detail: str) -> None:
+    """Emit an alert to console and to configured syslog targets."""
+    ts = utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    console_msg = (
+        f"[{ts}] ALERT rule={rule_id} severity={severity} src_ip={src_ip} | {detail}"
+    )
+    siem_msg = (
+        f"Alarm UEBA {src_ip} rule={rule_id} severity={severity} detail={detail}"
+    )
+
+    if severity in {"HIGH", "CRITICAL"}:
+        log.warning(console_msg)
     else:
-        log.info(msg)
-    if SYSLOG_AVAILABLE:
-        syslog_logger.warning(msg)
+        log.info(console_msg)
+
+    if SYSLOG_TARGETS:
+        syslog_logger.warning(siem_msg)
 
 
 # ---------------------------------------------------------------------------
-# Helper: geo-lookup (cached)
+# Helpers
 # ---------------------------------------------------------------------------
+def infer_internal_network(itr: pd.DataFrame) -> ipaddress.IPv4Network:
+    """Infer the dominant internal /24 from internal training source IPs."""
+    private_ips = [
+        ipaddress.IPv4Address(ip)
+        for ip in itr["src_ip"].dropna().unique()
+        if ipaddress.IPv4Address(ip).is_private
+    ]
+    if not private_ips:
+        raise ValueError("Could not infer internal network from training data.")
+
+    prefixes = Counter(".".join(str(ip).split(".")[:3]) for ip in private_ips)
+    prefix, _ = prefixes.most_common(1)[0]
+    return ipaddress.IPv4Network(f"{prefix}.0/24")
+
+
+def is_in_network(ip: str, network: ipaddress.IPv4Network) -> bool:
+    return ipaddress.IPv4Address(ip) in network
+
+
+def safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    ratio = numerator / denominator.replace(0, np.nan)
+    return ratio.replace([np.inf, -np.inf], np.nan)
+
+
 def build_cc_cache(ip_series: pd.Series, geodb) -> dict:
     """Return {ip_str: country_code} for a series of IP strings."""
     cache = {}
-    for ip in ip_series.unique():
+    for ip in pd.Series(ip_series).dropna().unique():
         try:
             cc = geodb.country(ip).country.iso_code
             cache[ip] = cc if cc else "XX"
@@ -97,113 +162,256 @@ def build_cc_cache(ip_series: pd.Series, geodb) -> dict:
     return cache
 
 
+def build_asn_cache(ip_series: pd.Series, geodbasn) -> dict:
+    """Return {ip_str: {asn, org}} for a series of IP strings."""
+    cache = {}
+    for ip in pd.Series(ip_series).dropna().unique():
+        try:
+            asn = geodbasn.asn(ip)
+            cache[ip] = {
+                "asn": int(asn.autonomous_system_number or 0),
+                "org": asn.autonomous_system_organization or "UNKNOWN",
+            }
+        except Exception:
+            cache[ip] = {"asn": 0, "org": "UNKNOWN"}
+    return cache
+
+
+def https_stats(df: pd.DataFrame) -> pd.DataFrame:
+    https = df[df["port"] == 443]
+    if https.empty:
+        return pd.DataFrame(
+            columns=["up_total", "down_total", "flows", "ratio"]
+        ).rename_axis("src_ip")
+
+    stats = https.groupby("src_ip").agg(
+        up_total=("up_bytes", "sum"),
+        down_total=("down_bytes", "sum"),
+        flows=("up_bytes", "count"),
+    )
+    stats["ratio"] = safe_ratio(stats["up_total"], stats["down_total"])
+    return stats
+
+
+def dns_stats(df: pd.DataFrame) -> pd.DataFrame:
+    dns = df[df["port"] == 53]
+    columns = [
+        "dns_flows",
+        "up_total",
+        "down_total",
+        "mean_up",
+        "max_up",
+        "mean_down",
+        "up_down_ratio",
+        "mean_interval",
+        "std_interval",
+    ]
+    if dns.empty:
+        return pd.DataFrame(columns=columns).rename_axis("src_ip")
+
+    stats = dns.groupby("src_ip").agg(
+        dns_flows=("up_bytes", "count"),
+        up_total=("up_bytes", "sum"),
+        down_total=("down_bytes", "sum"),
+        mean_up=("up_bytes", "mean"),
+        max_up=("up_bytes", "max"),
+        mean_down=("down_bytes", "mean"),
+    )
+    stats["up_down_ratio"] = safe_ratio(stats["up_total"], stats["down_total"])
+
+    dns_sorted = dns.sort_values(["src_ip", "timestamp"]).copy()
+    dns_sorted["diff"] = dns_sorted.groupby("src_ip")["timestamp"].diff()
+    intervals = dns_sorted.groupby("src_ip").agg(
+        mean_interval=("diff", "mean"),
+        std_interval=("diff", "std"),
+    )
+    return stats.join(intervals)
+
+
+def external_user_stats(df: pd.DataFrame) -> pd.DataFrame:
+    stats = df.groupby("src_ip").agg(
+        up_total=("up_bytes", "sum"),
+        down_total=("down_bytes", "sum"),
+        flows=("up_bytes", "count"),
+    )
+    stats["ratio"] = safe_ratio(stats["up_total"], stats["down_total"])
+
+    sorted_df = df.sort_values(["src_ip", "timestamp"]).copy()
+    sorted_df["diff"] = sorted_df.groupby("src_ip")["timestamp"].diff()
+    intervals = sorted_df.groupby("src_ip").agg(
+        mean_interval=("diff", "mean"),
+        std_interval=("diff", "std"),
+    )
+    return stats.join(intervals)
+
+
+def external_pair_interval_stats(
+    df: pd.DataFrame,
+    internal_net: ipaddress.IPv4Network,
+    min_intervals: int,
+) -> pd.DataFrame:
+    public_flows = df[
+        ~df["dst_ip"].apply(lambda ip: is_in_network(ip, internal_net))
+    ].sort_values(["src_ip", "dst_ip", "timestamp"])
+    if public_flows.empty:
+        return pd.DataFrame()
+
+    public_flows = public_flows.copy()
+    public_flows["diff"] = public_flows.groupby(["src_ip", "dst_ip"])[
+        "timestamp"
+    ].diff()
+    pair_stats = public_flows.groupby(["src_ip", "dst_ip"]).agg(
+        intervals=("diff", "count"),
+        mean_interval=("diff", "mean"),
+        std_interval=("diff", "std"),
+        ts_min=("timestamp", "min"),
+        ts_max=("timestamp", "max"),
+    )
+    pair_stats = pair_stats[pair_stats["intervals"] >= min_intervals].copy()
+    pair_stats["cov"] = (
+        pair_stats["std_interval"] / pair_stats["mean_interval"]
+    ).replace([np.inf, -np.inf], np.nan)
+    pair_stats["span"] = pair_stats["ts_max"] - pair_stats["ts_min"]
+    return pair_stats
+
+
+def empty_alert_df(columns: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(columns=columns)
+
+
 # ---------------------------------------------------------------------------
 # Baseline computation from training data
 # ---------------------------------------------------------------------------
-def compute_baselines(itr: pd.DataFrame, etr: pd.DataFrame, geodb) -> dict:
-    """
-    Derive all rule thresholds from the anomaly-free training datasets.
-    Returns a dict of named thresholds and supporting data structures.
-    """
-    log.info("Computing baselines from training data …")
+def compute_baselines(
+    itr: pd.DataFrame,
+    etr: pd.DataFrame,
+    geodb,
+    geodbasn,
+) -> dict:
+    """Derive rule thresholds and known-good entities from training data."""
+    log.info("Computing baselines from training data.")
     bl = {}
 
-    # --- HTTPS up/down ratio baseline (per device total) ------------------
-    https_r = itr[itr["port"] == 443]
-    up_r    = https_r.groupby("src_ip")["up_bytes"].sum()
-    dn_r    = https_r.groupby("src_ip")["down_bytes"].sum()
-    ratio_r = up_r / dn_r
-    bl["https_ratio_mean"] = ratio_r.mean()
-    bl["https_ratio_std"]  = ratio_r.std()
-    bl["https_ratio_thr"]  = ratio_r.mean() + SIGMA * ratio_r.std()
-    log.info(
-        "  HTTPS up/down ratio  mean=%.4f  std=%.5f  threshold=%.4f",
-        bl["https_ratio_mean"], bl["https_ratio_std"], bl["https_ratio_thr"],
-    )
+    internal_net = infer_internal_network(itr)
+    bl["internal_net"] = internal_net
+    log.info("  Internal network inferred: %s", internal_net)
 
-    # --- DNS flow count per device baseline --------------------------------
-    dns_r = itr[itr["port"] == 53]
-    dns_cnt_r = dns_r.groupby("src_ip").size()
-    bl["dns_count_mean"] = dns_cnt_r.mean()
-    bl["dns_count_std"]  = dns_cnt_r.std()
-    bl["dns_count_thr"]  = dns_cnt_r.mean() + SIGMA * dns_cnt_r.std()
-    log.info(
-        "  DNS flow count/dev   mean=%.1f  std=%.1f  threshold=%.1f",
-        bl["dns_count_mean"], bl["dns_count_std"], bl["dns_count_thr"],
-    )
-
-    # --- DNS per-flow upload size baseline ---------------------------------
-    bl["dns_up_mean"] = dns_r["up_bytes"].mean()
-    bl["dns_up_std"]  = dns_r["up_bytes"].std()
-    bl["dns_up_thr"]  = dns_r["up_bytes"].mean() + SIGMA * dns_r["up_bytes"].std()
-    log.info(
-        "  DNS up_bytes/flow    mean=%.1f  std=%.1f  threshold=%.1f",
-        bl["dns_up_mean"], bl["dns_up_std"], bl["dns_up_thr"],
-    )
-
-    # --- Botnet beaconing: per-(src,dst) CoV of intervals -----------------
-    # Only external (public) destinations
-    def is_public(ip: str) -> bool:
-        return ipaddress.IPv4Address(ip) not in INTERNAL_NET
-
-    itr_ext = itr[itr["dst_ip"].apply(is_public)].sort_values(
-        ["src_ip", "dst_ip", "timestamp"]
-    ).copy()
-    itr_ext["diff"] = itr_ext.groupby(["src_ip", "dst_ip"])["timestamp"].diff()
-    pair_r = itr_ext.groupby(["src_ip", "dst_ip"])["diff"].agg(["count", "mean", "std"])
-    pair_r = pair_r[pair_r["count"] >= 30].copy()
-    pair_r["cov"] = (pair_r["std"] / pair_r["mean"]).fillna(0)
-    bl["beacon_cov_min"]  = pair_r["cov"].min()
-    bl["beacon_cov_mean"] = pair_r["cov"].mean()
-    bl["beacon_cov_std"]  = pair_r["cov"].std()
-    # Threshold: anything BELOW mean-3σ (abnormally regular)
-    # Floor at 0.10 to avoid flagging CDN bursts; true botnet shows CoV << 0.01
-    bl["beacon_cov_thr"]  = max(
-        pair_r["cov"].mean() - SIGMA * pair_r["cov"].std(), 0.10
+    private_train = itr[
+        itr["dst_ip"].apply(lambda ip: is_in_network(ip, internal_net))
+    ].copy()
+    service_rows = private_train[["dst_ip", "port", "proto"]].drop_duplicates()
+    allowed_services = {
+        (row.dst_ip, int(row.port), row.proto)
+        for row in service_rows.itertuples(index=False)
+    }
+    bl["allowed_internal_services"] = allowed_services
+    bl["allowed_internal_servers"] = {dst for dst, _, _ in allowed_services}
+    bl["allowed_internal_service_labels"] = sorted(
+        f"{dst}:{port}/{proto}" for dst, port, proto in allowed_services
     )
     log.info(
-        "  Beacon CoV (pair)    min=%.3f  mean=%.3f  std=%.3f  threshold=%.3f",
-        bl["beacon_cov_min"], bl["beacon_cov_mean"],
-        bl["beacon_cov_std"], bl["beacon_cov_thr"],
+        "  Internal services allowed: %s",
+        ", ".join(bl["allowed_internal_service_labels"]),
     )
 
-    # --- Baseline countries (from internal HTTPS to public IPs) -----------
-    pub_https_r = itr[itr["port"] == 443]
-    pub_ips_r   = pub_https_r[
-        pub_https_r["dst_ip"].apply(is_public)
-    ]["dst_ip"]
-    cc_cache_r  = build_cc_cache(pub_ips_r, geodb)
-    bl["train_countries"]    = set(cc_cache_r.values())
-    bl["train_dst_ips"]      = set(pub_ips_r.unique())
-    bl["cc_cache_train"]     = cc_cache_r
-    log.info("  Known countries: %s", sorted(bl["train_countries"]))
+    bl["corporate_servers"] = set(etr["dst_ip"].unique())
+    log.info("  Corporate public servers: %s", sorted(bl["corporate_servers"]))
 
-    # --- External user baselines ------------------------------------------
-    up_er      = etr.groupby("src_ip")["up_bytes"].sum()
-    dn_er      = etr.groupby("src_ip")["down_bytes"].sum()
-    ratio_er   = up_er / dn_er
-    bl["ext_ratio_mean"] = ratio_er.mean()
-    bl["ext_ratio_std"]  = ratio_er.std()
-    bl["ext_ratio_lo"]   = ratio_er.mean() - SIGMA * ratio_er.std()
-    bl["ext_ratio_hi"]   = ratio_er.mean() + SIGMA * ratio_er.std()
+    https_train = https_stats(itr)
+    bl["https_train_stats"] = https_train
+    bl["https_ratio_min"] = float(https_train["ratio"].min())
+    bl["https_ratio_max"] = float(https_train["ratio"].max())
+    bl["https_ratio_mean"] = float(https_train["ratio"].mean())
+    bl["https_ratio_std"] = float(https_train["ratio"].std())
+    if bl["https_ratio_min"] > 0:
+        bl["https_ratio_factor_thr"] = (
+            bl["https_ratio_max"] / bl["https_ratio_min"]
+        )
+    else:
+        bl["https_ratio_factor_thr"] = SIGMA
     log.info(
-        "  Ext up/down ratio    mean=%.5f  std=%.6f  range=[%.5f, %.5f]",
-        bl["ext_ratio_mean"], bl["ext_ratio_std"],
-        bl["ext_ratio_lo"], bl["ext_ratio_hi"],
+        "  HTTPS up/down ratio min=%.6f max=%.6f factor_thr=%.3f",
+        bl["https_ratio_min"],
+        bl["https_ratio_max"],
+        bl["https_ratio_factor_thr"],
     )
 
-    etr_s = etr.sort_values(["src_ip", "timestamp"]).copy()
-    etr_s["diff"] = etr_s.groupby("src_ip")["timestamp"].diff()
-    aibf_er = etr_s.groupby("src_ip")["diff"].mean()
-    bl["ext_aibf_mean"] = aibf_er.mean()
-    bl["ext_aibf_std"]  = aibf_er.std()
-    bl["ext_aibf_thr"]  = aibf_er.mean() + SIGMA * aibf_er.std()
+    dns_train = dns_stats(itr)
+    bl["dns_train_stats"] = dns_train
+    bl["dns_flow_max"] = int(dns_train["dns_flows"].max())
+    bl["dns_total_up_max"] = int(dns_train["up_total"].max())
+    bl["dns_mean_up_max"] = float(dns_train["mean_up"].max())
+    bl["dns_flow_up_max"] = int(dns_train["max_up"].max())
+    bl["dns_ratio_max"] = float(dns_train["up_down_ratio"].max())
+    bl["dns_mean_interval_min"] = float(dns_train["mean_interval"].min())
     log.info(
-        "  Ext interval/flow    mean=%.1f  std=%.1f  threshold=%.1f",
-        bl["ext_aibf_mean"], bl["ext_aibf_std"], bl["ext_aibf_thr"],
+        "  DNS max flows=%d max total_up=%d max mean_up=%.2f min interval=%.2fs",
+        bl["dns_flow_max"],
+        bl["dns_total_up_max"],
+        bl["dns_mean_up_max"],
+        bl["dns_mean_interval_min"] / 100,
     )
 
+    bl["beacon_min_intervals"] = 30
+    bl["beacon_min_interval"] = 6000
+    bl["beacon_min_span"] = 0.10 * DAY_UNITS
+    pair_train = external_pair_interval_stats(
+        itr, internal_net, bl["beacon_min_intervals"]
+    )
+    bl["beacon_cov_min"] = float(pair_train["cov"].min())
+    bl["beacon_cov_mean"] = float(pair_train["cov"].mean())
+    bl["beacon_cov_std"] = float(pair_train["cov"].std())
+    bl["beacon_cov_thr"] = max(
+        0.0, bl["beacon_cov_mean"] - SIGMA * bl["beacon_cov_std"]
+    )
+    log.info(
+        "  Beacon CoV min=%.3f mean=%.3f std=%.3f threshold<%.3f",
+        bl["beacon_cov_min"],
+        bl["beacon_cov_mean"],
+        bl["beacon_cov_std"],
+        bl["beacon_cov_thr"],
+    )
+
+    pub_https_train = itr[
+        (itr["port"] == 443)
+        & ~itr["dst_ip"].apply(lambda ip: is_in_network(ip, internal_net))
+    ].copy()
+    cc_cache_train = build_cc_cache(pub_https_train["dst_ip"], geodb)
+    asn_cache_train = build_asn_cache(pub_https_train["dst_ip"], geodbasn)
+    pub_https_train["dst_cc"] = pub_https_train["dst_ip"].map(cc_cache_train)
+    country_counts = pub_https_train.groupby(["src_ip", "dst_cc"]).size()
+
+    bl["train_countries"] = set(cc_cache_train.values())
+    bl["train_dst_ips"] = set(pub_https_train["dst_ip"].unique())
+    bl["cc_cache_train"] = cc_cache_train
+    bl["asn_cache_train"] = asn_cache_train
+    bl["train_asns"] = {item["asn"] for item in asn_cache_train.values()}
+    bl["country_flow_high_thr"] = int(max(1, country_counts.quantile(0.75)))
+    log.info(
+        "  Known countries=%d high new-country flow threshold=%d",
+        len(bl["train_countries"]),
+        bl["country_flow_high_thr"],
+    )
+
+    external_train = external_user_stats(etr)
+    bl["external_train_stats"] = external_train
+    bl["ext_ratio_min"] = float(external_train["ratio"].min())
+    bl["ext_ratio_max"] = float(external_train["ratio"].max())
+    bl["ext_ratio_mean"] = float(external_train["ratio"].mean())
+    bl["ext_ratio_std"] = float(external_train["ratio"].std())
+    ratio_range = bl["ext_ratio_max"] - bl["ext_ratio_min"]
+    bl["ext_ratio_factor_thr"] = 1 + (ratio_range / bl["ext_ratio_mean"]) / 2
+    bl["ext_interval_max"] = float(external_train["mean_interval"].max())
+    bl["ext_interval_mean"] = float(external_train["mean_interval"].mean())
+    bl["ext_interval_std"] = float(external_train["mean_interval"].std())
     bl["train_ext_ips"] = set(etr["src_ip"].unique())
+    log.info(
+        "  External ratio range=[%.6f, %.6f] factor_thr=%.4f interval max=%.2fs",
+        bl["ext_ratio_min"],
+        bl["ext_ratio_max"],
+        bl["ext_ratio_factor_thr"],
+        bl["ext_interval_max"] / 100,
+    )
 
     return bl
 
@@ -211,339 +419,660 @@ def compute_baselines(itr: pd.DataFrame, etr: pd.DataFrame, geodb) -> dict:
 # ---------------------------------------------------------------------------
 # Rule implementations
 # ---------------------------------------------------------------------------
-
-def rule_r1_botnet_beaconing(ite: pd.DataFrame, bl: dict) -> pd.DataFrame:
+def rule_r1_botnet(ite: pd.DataFrame, bl: dict, emit: bool = True) -> pd.DataFrame:
     """
-    R1 – Internal BotNet: detect devices with extremely regular (low CoV)
-    periodic connections to a SINGLE external IP address, sustained over the day.
-
-    Two conditions must both be met:
-      (a) CoV < beacon_cov_thr  (statistically abnormal regularity vs training)
-      (b) mean_interval >= 6000 (1/100 s) = 60 s  — sustained periodic beaconing,
-          not a short burst; and the flows span >= 10 % of the day.
+    R1 - Internal BotNet activity:
+      R1a: internal communication to non-server internal destinations/services.
+      R1b: very regular external beaconing to one destination.
     """
-    log.info("=== R1: BotNet beaconing (per src/dst interval CoV) ===")
+    if emit:
+        log.info("=== R1: Internal BotNet activity ===")
 
-    def is_public(ip):
-        return ipaddress.IPv4Address(ip) not in INTERNAL_NET
+    columns = [
+        "rule",
+        "severity",
+        "src_ip",
+        "dst_ip",
+        "port",
+        "proto",
+        "flows",
+        "metric",
+        "threshold",
+        "detail",
+    ]
+    results = []
+    internal_net = bl["internal_net"]
 
-    ite_ext = ite[ite["dst_ip"].apply(is_public)].sort_values(
-        ["src_ip", "dst_ip", "timestamp"]
-    ).copy()
-    ite_ext["diff"] = ite_ext.groupby(["src_ip", "dst_ip"])["timestamp"].diff()
-
-    pair_t = ite_ext.groupby(["src_ip", "dst_ip"]).agg(
-        count=("diff", "count"),
-        mean_interval=("diff", "mean"),
-        std_interval=("diff", "std"),
-        ts_min=("timestamp", "min"),
-        ts_max=("timestamp", "max"),
+    private_test = ite[
+        ite["dst_ip"].apply(lambda ip: is_in_network(ip, internal_net))
+    ].copy()
+    allowed = pd.DataFrame(
+        list(bl["allowed_internal_services"]),
+        columns=["dst_ip", "port", "proto"],
     )
-    pair_t = pair_t[pair_t["count"] >= 30].copy()
-    pair_t["cov"]      = (pair_t["std_interval"] / pair_t["mean_interval"]).fillna(0)
-    pair_t["span"]     = pair_t["ts_max"] - pair_t["ts_min"]   # 1/100 s
-    DAY_UNITS          = 86400 * 100                            # full day in 1/100s
-    thr = bl["beacon_cov_thr"]
-
-    # Require: low CoV AND mean interval >= 60 s AND spans >= 10 % of day
-    flagged = pair_t[
-        (pair_t["cov"] < thr)
-        & (pair_t["mean_interval"] >= 6000)
-        & (pair_t["span"] >= 0.10 * DAY_UNITS)
-    ].reset_index()
-    flagged["mean_interval_s"] = (flagged["mean_interval"] / 100).round(1)
-
-    for _, row in flagged.iterrows():
-        alert(
-            "R1", "HIGH", row["src_ip"],
-            f"BotNet beaconing → dst={row['dst_ip']}  "
-            f"flows={int(row['count'])}  "
-            f"mean_interval={row['mean_interval_s']:.1f}s  "
-            f"CoV={row['cov']:.4f}  (threshold={thr:.4f})",
+    if not allowed.empty and not private_test.empty:
+        private_test = private_test.merge(
+            allowed.assign(_allowed=True),
+            on=["dst_ip", "port", "proto"],
+            how="left",
         )
-    if flagged.empty:
-        log.info("  No BotNet beaconing detected.")
-    return flagged[["src_ip", "dst_ip", "count", "mean_interval_s", "cov"]]
+        unexpected = private_test[private_test["_allowed"].isna()].copy()
+    else:
+        unexpected = private_test
 
-
-def rule_r2_https_exfiltration(ite: pd.DataFrame, bl: dict) -> pd.DataFrame:
-    """
-    R2 – Data exfiltration via HTTPS: detect devices whose HTTPS upload/download
-    ratio greatly exceeds the baseline (upload >> download implies data exfiltration).
-
-    Threshold: ratio > mean + 3σ  (baseline mean≈0.108, threshold≈0.116)
-    """
-    log.info("=== R2: HTTPS data exfiltration (up/down ratio) ===")
-    https_t = ite[ite["port"] == 443]
-    up_t    = https_t.groupby("src_ip")["up_bytes"].sum()
-    dn_t    = https_t.groupby("src_ip")["down_bytes"].sum()
-    ratio_t = (up_t / dn_t).rename("ratio")
-    thr     = bl["https_ratio_thr"]
-
-    flagged = ratio_t[ratio_t > thr].reset_index()
-    flagged["up_total"]  = up_t[flagged["src_ip"]].values
-    flagged["dn_total"]  = dn_t[flagged["src_ip"]].values
-    flagged = flagged.sort_values("ratio", ascending=False)
-
-    for _, row in flagged.iterrows():
-        alert(
-            "R2", "HIGH", row["src_ip"],
-            f"HTTPS exfiltration: up/down ratio={row['ratio']:.4f}  "
-            f"(threshold={thr:.4f})  "
-            f"up={int(row['up_total']):,}B  down={int(row['dn_total']):,}B",
+    if not unexpected.empty:
+        summary = (
+            unexpected.groupby(["src_ip", "dst_ip", "port", "proto"])
+            .agg(
+                flows=("up_bytes", "count"),
+                up_total=("up_bytes", "sum"),
+                down_total=("down_bytes", "sum"),
+                first_seen=("timestamp", "min"),
+                last_seen=("timestamp", "max"),
+            )
+            .reset_index()
+            .sort_values(["src_ip", "flows"], ascending=[True, False])
         )
-    if flagged.empty:
+        allowed_text = ", ".join(bl["allowed_internal_service_labels"])
+        for row in summary.itertuples(index=False):
+            detail = (
+                f"Unauthorized internal service dst={row.dst_ip}:{int(row.port)}/"
+                f"{row.proto} flows={int(row.flows)} up={int(row.up_total)}B "
+                f"down={int(row.down_total)}B; allowed_services=[{allowed_text}]"
+            )
+            results.append(
+                {
+                    "rule": "R1a",
+                    "severity": "HIGH",
+                    "src_ip": row.src_ip,
+                    "dst_ip": row.dst_ip,
+                    "port": int(row.port),
+                    "proto": row.proto,
+                    "flows": int(row.flows),
+                    "metric": int(row.flows),
+                    "threshold": "service not seen in training",
+                    "detail": detail,
+                }
+            )
+            if emit:
+                alert("R1a", "HIGH", row.src_ip, detail)
+
+    pair_stats = external_pair_interval_stats(
+        ite, internal_net, bl["beacon_min_intervals"]
+    )
+    if not pair_stats.empty:
+        beacon = pair_stats[
+            (pair_stats["cov"] < bl["beacon_cov_thr"])
+            & (pair_stats["mean_interval"] >= bl["beacon_min_interval"])
+            & (pair_stats["span"] >= bl["beacon_min_span"])
+        ].reset_index()
+        beacon = beacon.sort_values("cov")
+        for row in beacon.itertuples(index=False):
+            flows = int(row.intervals) + 1
+            interval_s = row.mean_interval / 100
+            detail = (
+                f"External beaconing dst={row.dst_ip} flows={flows} "
+                f"mean_interval={interval_s:.1f}s cov={row.cov:.4f} "
+                f"threshold_cov<{bl['beacon_cov_thr']:.4f}"
+            )
+            results.append(
+                {
+                    "rule": "R1b",
+                    "severity": "HIGH",
+                    "src_ip": row.src_ip,
+                    "dst_ip": row.dst_ip,
+                    "port": "",
+                    "proto": "",
+                    "flows": flows,
+                    "metric": round(float(row.cov), 6),
+                    "threshold": f"cov<{bl['beacon_cov_thr']:.4f}",
+                    "detail": detail,
+                }
+            )
+            if emit:
+                alert("R1b", "HIGH", row.src_ip, detail)
+
+    if not results and emit:
+        log.info("  No BotNet activity detected.")
+    return pd.DataFrame(results, columns=columns)
+
+
+def rule_r2_https_exfiltration(
+    ite: pd.DataFrame, bl: dict, emit: bool = True
+) -> pd.DataFrame:
+    """R2 - HTTPS exfiltration using per-device historical ratio drift."""
+    if emit:
+        log.info("=== R2: HTTPS data exfiltration ===")
+
+    stats = https_stats(ite)
+    train = bl["https_train_stats"][["ratio"]].rename(
+        columns={"ratio": "train_ratio"}
+    )
+    joined = stats.join(train, how="left")
+    joined["ratio_factor"] = joined["ratio"] / joined["train_ratio"]
+
+    known = joined["train_ratio"].notna()
+    known_anomaly = (
+        known
+        & (joined["ratio"] > bl["https_ratio_max"])
+        & (joined["ratio_factor"] > bl["https_ratio_factor_thr"])
+    )
+    unknown_anomaly = (
+        ~known
+        & (joined["ratio"] > bl["https_ratio_max"] * bl["https_ratio_factor_thr"])
+    )
+    flagged = joined[known_anomaly | unknown_anomaly].copy()
+    flagged = flagged.sort_values("ratio", ascending=False).reset_index()
+
+    rows = []
+    for row in flagged.itertuples(index=False):
+        detail = (
+            f"HTTPS up/down ratio={row.ratio:.4f} train_ratio="
+            f"{row.train_ratio:.4f} ratio_factor={row.ratio_factor:.2f} "
+            f"threshold_ratio>{bl['https_ratio_max']:.4f} "
+            f"threshold_factor>{bl['https_ratio_factor_thr']:.2f} "
+            f"up={int(row.up_total)}B down={int(row.down_total)}B"
+        )
+        rows.append(
+            {
+                "rule": "R2",
+                "severity": "HIGH",
+                "src_ip": row.src_ip,
+                "ratio": float(row.ratio),
+                "train_ratio": float(row.train_ratio)
+                if pd.notna(row.train_ratio)
+                else np.nan,
+                "ratio_factor": float(row.ratio_factor)
+                if pd.notna(row.ratio_factor)
+                else np.nan,
+                "up_total": int(row.up_total),
+                "down_total": int(row.down_total),
+                "threshold": (
+                    f"ratio>{bl['https_ratio_max']:.4f} and "
+                    f"factor>{bl['https_ratio_factor_thr']:.2f}"
+                ),
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R2", "HIGH", row.src_ip, detail)
+
+    if not rows and emit:
         log.info("  No HTTPS exfiltration detected.")
-    return flagged[["src_ip", "ratio", "up_total", "dn_total"]]
-
-
-def rule_r3_dns_exfiltration(ite: pd.DataFrame, bl: dict) -> pd.DataFrame:
-    """
-    R3 – Data exfiltration via DNS: detect devices generating an abnormally
-    large number of DNS queries, consistent with DNS tunnelling (data encoded
-    in query names / subdomain labels).
-
-    Threshold: DNS flow count per device > mean + 3σ  (baseline max≈1446, thr≈1399)
-    """
-    log.info("=== R3: DNS data exfiltration (high DNS flow count) ===")
-    dns_t   = ite[ite["port"] == 53]
-    cnt_t   = dns_t.groupby("src_ip").size().rename("dns_flows")
-    thr     = bl["dns_count_thr"]
-    flagged = cnt_t[cnt_t > thr].reset_index().sort_values("dns_flows", ascending=False)
-
-    for _, row in flagged.iterrows():
-        up_mean = dns_t[dns_t["src_ip"] == row["src_ip"]]["up_bytes"].mean()
-        alert(
-            "R3", "HIGH", row["src_ip"],
-            f"DNS exfiltration: dns_flows={int(row['dns_flows'])}  "
-            f"(threshold={thr:.0f})  "
-            f"mean_payload={up_mean:.0f}B",
-        )
-    if flagged.empty:
-        log.info("  No DNS exfiltration detected.")
-    return flagged[["src_ip", "dns_flows"]]
-
-
-def rule_r4_cc_dns(ite: pd.DataFrame, bl: dict) -> pd.DataFrame:
-    """
-    R4 – C&C via DNS: detect devices issuing high-frequency DNS queries
-    (very short mean interval between DNS flows), consistent with polling
-    a C&C server for commands embedded in DNS responses.
-
-    Flag devices where dns_flows > dns_count_thr / 4  AND  mean_interval < 200 (1/100s)
-    (i.e. more than ~1 query every 2 s, over a sustained period).
-    """
-    log.info("=== R4: C&C via DNS (high-frequency DNS polling) ===")
-    dns_t  = ite[ite["port"] == 53].sort_values(["src_ip", "timestamp"]).copy()
-    dns_t["diff"] = dns_t.groupby("src_ip")["timestamp"].diff()
-    stats  = dns_t.groupby("src_ip").agg(
-        dns_flows=("up_bytes", "count"),
-        mean_interval=("diff", "mean"),
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "rule",
+            "severity",
+            "src_ip",
+            "ratio",
+            "train_ratio",
+            "ratio_factor",
+            "up_total",
+            "down_total",
+            "threshold",
+            "detail",
+        ],
     )
-    # Must have anomalously many queries AND short intervals
-    thr_cnt  = bl["dns_count_thr"] / 4   # more permissive count
-    thr_int  = 200                         # < 2 s between queries (1/100 s units)
 
-    flagged = stats[
-        (stats["dns_flows"] > thr_cnt) & (stats["mean_interval"] < thr_int)
-    ].reset_index().sort_values("dns_flows", ascending=False)
 
-    for _, row in flagged.iterrows():
-        interval_s = row["mean_interval"] / 100
-        alert(
-            "R4", "HIGH", row["src_ip"],
-            f"C&C via DNS: flows={int(row['dns_flows'])}  "
-            f"mean_interval={interval_s:.2f}s  "
-            f"(thr_count>{thr_cnt:.0f}, thr_interval<{thr_int/100:.0f}s)",
+def rule_r3_dns_exfiltration(
+    ite: pd.DataFrame, bl: dict, emit: bool = True
+) -> pd.DataFrame:
+    """
+    R3 - DNS exfiltration.
+
+    This rule is intentionally separated from DNS C&C. High DNS flow counts
+    with normal payload size and very short intervals are handled by R4.
+    """
+    if emit:
+        log.info("=== R3: DNS data exfiltration ===")
+
+    stats = dns_stats(ite)
+    payload_anomaly = (
+        (stats["mean_up"] > bl["dns_mean_up_max"])
+        | (stats["up_down_ratio"] > bl["dns_ratio_max"])
+    )
+    volume_anomaly = stats["up_total"] > bl["dns_total_up_max"]
+    flagged = stats[payload_anomaly & volume_anomaly].copy()
+    flagged = flagged.sort_values("up_total", ascending=False).reset_index()
+
+    rows = []
+    for row in flagged.itertuples(index=False):
+        detail = (
+            f"DNS payload anomaly flows={int(row.dns_flows)} "
+            f"up_total={int(row.up_total)}B mean_up={row.mean_up:.2f}B "
+            f"max_up={int(row.max_up)}B up/down={row.up_down_ratio:.4f}; "
+            f"thresholds up_total>{bl['dns_total_up_max']}B and "
+            f"(mean_up>{bl['dns_mean_up_max']:.2f}B or "
+            f"up/down>{bl['dns_ratio_max']:.4f})"
         )
-    if flagged.empty:
+        rows.append(
+            {
+                "rule": "R3",
+                "severity": "HIGH",
+                "src_ip": row.src_ip,
+                "dns_flows": int(row.dns_flows),
+                "up_total": int(row.up_total),
+                "mean_up": float(row.mean_up),
+                "max_up": int(row.max_up),
+                "up_down_ratio": float(row.up_down_ratio),
+                "threshold": (
+                    f"up_total>{bl['dns_total_up_max']} and "
+                    f"(mean_up>{bl['dns_mean_up_max']:.2f} or "
+                    f"up/down>{bl['dns_ratio_max']:.4f})"
+                ),
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R3", "HIGH", row.src_ip, detail)
+
+    if not rows and emit:
+        log.info("  No DNS exfiltration detected.")
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "rule",
+            "severity",
+            "src_ip",
+            "dns_flows",
+            "up_total",
+            "mean_up",
+            "max_up",
+            "up_down_ratio",
+            "threshold",
+            "detail",
+        ],
+    )
+
+
+def rule_r4_cc_dns(ite: pd.DataFrame, bl: dict, emit: bool = True) -> pd.DataFrame:
+    """R4 - DNS C&C: excess DNS flows plus faster polling than history."""
+    if emit:
+        log.info("=== R4: C&C via DNS ===")
+
+    stats = dns_stats(ite)
+    flagged = stats[
+        (stats["dns_flows"] > bl["dns_flow_max"])
+        & (stats["mean_interval"] < bl["dns_mean_interval_min"])
+    ].copy()
+    flagged = flagged.sort_values("dns_flows", ascending=False).reset_index()
+
+    rows = []
+    for row in flagged.itertuples(index=False):
+        detail = (
+            f"DNS C&C polling flows={int(row.dns_flows)} "
+            f"mean_interval={row.mean_interval / 100:.2f}s; "
+            f"thresholds flows>{bl['dns_flow_max']} and "
+            f"mean_interval<{bl['dns_mean_interval_min'] / 100:.2f}s"
+        )
+        rows.append(
+            {
+                "rule": "R4",
+                "severity": "HIGH",
+                "src_ip": row.src_ip,
+                "dns_flows": int(row.dns_flows),
+                "mean_interval": float(row.mean_interval),
+                "mean_interval_s": float(row.mean_interval / 100),
+                "threshold": (
+                    f"flows>{bl['dns_flow_max']} and "
+                    f"interval<{bl['dns_mean_interval_min'] / 100:.2f}s"
+                ),
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R4", "HIGH", row.src_ip, detail)
+
+    if not rows and emit:
         log.info("  No C&C via DNS detected.")
-    return flagged[["src_ip", "dns_flows", "mean_interval"]]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "rule",
+            "severity",
+            "src_ip",
+            "dns_flows",
+            "mean_interval",
+            "mean_interval_s",
+            "threshold",
+            "detail",
+        ],
+    )
 
 
-def rule_r5_anomalous_destinations(ite: pd.DataFrame, bl: dict, geodb) -> pd.DataFrame:
-    """
-    R5 – Anomalous external destinations: detect internal devices communicating
-    with countries not present in the training baseline.
+def rule_r5_anomalous_destinations(
+    ite: pd.DataFrame,
+    bl: dict,
+    geodb,
+    geodbasn,
+    emit: bool = True,
+) -> pd.DataFrame:
+    """R5 - Internal users contacting countries not present in history."""
+    if emit:
+        log.info("=== R5: Anomalous external destinations ===")
 
-    Uses geo-localization of public destination IPs.
-    """
-    log.info("=== R5: Anomalous external destinations (new countries) ===")
+    internal_net = bl["internal_net"]
+    https = ite[ite["port"] == 443]
+    public_https = https[
+        ~https["dst_ip"].apply(lambda ip: is_in_network(ip, internal_net))
+    ].copy()
+    if public_https.empty:
+        return empty_alert_df(
+            [
+                "rule",
+                "severity",
+                "src_ip",
+                "dst_cc",
+                "dst_org",
+                "flows",
+                "threshold",
+                "detail",
+            ]
+        )
 
-    def is_public(ip):
-        return ipaddress.IPv4Address(ip) not in INTERNAL_NET
+    known_cc = bl["cc_cache_train"]
+    known_asn = bl["asn_cache_train"]
+    new_ips = [ip for ip in public_https["dst_ip"].unique() if ip not in known_cc]
+    cc_map = {**known_cc, **build_cc_cache(pd.Series(new_ips), geodb)}
+    asn_map = {**known_asn, **build_asn_cache(pd.Series(new_ips), geodbasn)}
 
-    https_t = ite[ite["port"] == 443]
-    pub_t   = https_t[https_t["dst_ip"].apply(is_public)].copy()
+    public_https["dst_cc"] = public_https["dst_ip"].map(cc_map).fillna("XX")
+    public_https["dst_asn"] = public_https["dst_ip"].map(
+        lambda ip: asn_map.get(ip, {}).get("asn", 0)
+    )
+    public_https["dst_org"] = public_https["dst_ip"].map(
+        lambda ip: asn_map.get(ip, {}).get("org", "UNKNOWN")
+    )
 
-    # Re-use known cc cache; look up only new IPs
-    known_cc   = bl["cc_cache_train"]
-    new_ips    = [ip for ip in pub_t["dst_ip"].unique() if ip not in known_cc]
-    new_cc_map = build_cc_cache(pd.Series(new_ips), geodb)
-    cc_map     = {**known_cc, **new_cc_map}
-
-    pub_t["dst_cc"] = pub_t["dst_ip"].map(cc_map).fillna("XX")
-    train_cc = bl["train_countries"]
-    new_country_flows = pub_t[~pub_t["dst_cc"].isin(train_cc)]
-
+    new_country_flows = public_https[
+        ~public_https["dst_cc"].isin(bl["train_countries"])
+    ].copy()
     if new_country_flows.empty:
-        log.info("  No anomalous destinations detected.")
-        return pd.DataFrame()
+        if emit:
+            log.info("  No anomalous destinations detected.")
+        return empty_alert_df(
+            [
+                "rule",
+                "severity",
+                "src_ip",
+                "dst_cc",
+                "dst_org",
+                "flows",
+                "threshold",
+                "detail",
+            ]
+        )
 
-    # Aggregate: per (src_ip, country)
     summary = (
-        new_country_flows.groupby(["src_ip", "dst_cc"])
-        .agg(flows=("up_bytes", "count"), up_bytes=("up_bytes", "sum"))
+        new_country_flows.groupby(["src_ip", "dst_cc", "dst_asn", "dst_org"])
+        .agg(
+            flows=("up_bytes", "count"),
+            up_bytes=("up_bytes", "sum"),
+            dst_ips=("dst_ip", "nunique"),
+        )
         .reset_index()
         .sort_values(["src_ip", "flows"], ascending=[True, False])
     )
+    totals = summary.groupby("src_ip")["flows"].sum()
+    summary["total_new_country_flows"] = summary["src_ip"].map(totals)
+    summary["severity"] = np.where(
+        summary["total_new_country_flows"] >= bl["country_flow_high_thr"],
+        "HIGH",
+        "MEDIUM",
+    )
+    summary["rule"] = "R5"
+    summary["threshold"] = (
+        "country not in training; high severity if "
+        f"total_flows>={bl['country_flow_high_thr']}"
+    )
 
-    for src_ip in summary["src_ip"].unique():
-        sub = summary[summary["src_ip"] == src_ip]
-        countries = ", ".join(
-            f"{r['dst_cc']}({int(r['flows'])})" for _, r in sub.iterrows()
+    summary["detail"] = ""
+    for src_ip, sub in summary.groupby("src_ip"):
+        total = int(sub["flows"].sum())
+        severity = "HIGH" if total >= bl["country_flow_high_thr"] else "MEDIUM"
+        by_country = sub.groupby("dst_cc")["flows"].sum().sort_values(
+            ascending=False
         )
-        alert(
-            "R5", "MEDIUM", src_ip,
-            f"Traffic to new countries: {countries}",
+        by_org = sub.groupby("dst_org")["flows"].sum().sort_values(ascending=False)
+        countries = ", ".join(f"{cc}({int(n)})" for cc, n in by_country.items())
+        owners = ", ".join(
+            f"{org}({int(n)})" for org, n in by_org.head(3).items()
         )
-    return summary
+        detail = (
+            f"Traffic to new countries countries={countries}; "
+            f"top_owners={owners}; total_flows={total}; "
+            f"high_threshold>={bl['country_flow_high_thr']}"
+        )
+        summary.loc[summary["src_ip"] == src_ip, "detail"] = detail
+        if emit:
+            alert("R5", severity, src_ip, detail)
+
+    return summary[
+        [
+            "rule",
+            "severity",
+            "src_ip",
+            "dst_cc",
+            "dst_asn",
+            "dst_org",
+            "flows",
+            "up_bytes",
+            "dst_ips",
+            "total_new_country_flows",
+            "threshold",
+            "detail",
+        ]
+    ]
 
 
-def rule_r6_anomalous_external_users(ete: pd.DataFrame, bl: dict) -> pd.DataFrame:
+def rule_r6_anomalous_external_users(
+    ete: pd.DataFrame, bl: dict, emit: bool = True
+) -> pd.DataFrame:
     """
-    R6 – Anomalous external users: detect external clients accessing corporate
-    servers in an anomalous way (three sub-checks):
-      R6a – Source IP not seen in training (entirely new client)
-      R6b – Up/down ratio outside baseline range (abnormal request/response ratio)
-      R6c – Mean inter-flow interval far above baseline (very slow / irregular access)
+    R6 - External users behaving anomalously.
+
+    New source IPs are not alerted by themselves. They are only alerted if their
+    ratio or timing is outside the clean historical range.
     """
-    log.info("=== R6: Anomalous external users ===")
-    results = []
+    if emit:
+        log.info("=== R6: Anomalous external users ===")
 
-    # R6a – new source IPs
-    new_ips = sorted(set(ete["src_ip"].unique()) - bl["train_ext_ips"])
-    for ip in new_ips:
-        n = len(ete[ete["src_ip"] == ip])
-        alert("R6a", "HIGH", ip, f"Unknown external client (not in baseline), flows={n}")
-        results.append({"src_ip": ip, "reason": "new_client", "value": float(n)})
+    stats = external_user_stats(ete)
+    train = bl["external_train_stats"][["ratio"]].rename(
+        columns={"ratio": "train_ratio"}
+    )
+    stats = stats.join(train, how="left")
+    stats["ratio_factor_high"] = stats["ratio"] / stats["train_ratio"]
+    stats["ratio_factor_low"] = stats["train_ratio"] / stats["ratio"]
+    rows = []
 
-    # R6b – up/down ratio
-    up_et  = ete.groupby("src_ip")["up_bytes"].sum()
-    dn_et  = ete.groupby("src_ip")["down_bytes"].sum()
-    ratio_et = up_et / dn_et
-    lo, hi   = bl["ext_ratio_lo"], bl["ext_ratio_hi"]
-    bad_ratio = ratio_et[(ratio_et < lo) | (ratio_et > hi)]
-    for ip, val in bad_ratio.items():
-        alert(
-            "R6b", "MEDIUM", ip,
-            f"Abnormal up/down ratio={val:.5f}  "
-            f"(baseline=[{lo:.5f}, {hi:.5f}])",
+    bad_ratio = stats[
+        (
+            (stats["ratio"] < bl["ext_ratio_min"])
+            & (
+                (
+                    stats["train_ratio"].notna()
+                    & (stats["ratio_factor_low"] > bl["ext_ratio_factor_thr"])
+                )
+                | (
+                    stats["train_ratio"].isna()
+                    & (
+                        stats["ratio"]
+                        < bl["ext_ratio_min"] / bl["ext_ratio_factor_thr"]
+                    )
+                )
+            )
         )
-        results.append({"src_ip": ip, "reason": "ratio", "value": round(val, 6)})
-
-    # R6c – inter-flow interval
-    ete_s = ete.sort_values(["src_ip", "timestamp"]).copy()
-    ete_s["diff"] = ete_s.groupby("src_ip")["timestamp"].diff()
-    aibf_t = ete_s.groupby("src_ip")["diff"].mean()
-    thr_aibf = bl["ext_aibf_thr"]
-    bad_interval = aibf_t[aibf_t > thr_aibf]
-    for ip, val in bad_interval.items():
-        alert(
-            "R6c", "MEDIUM", ip,
-            f"Abnormal mean inter-flow interval={val/100:.1f}s  "
-            f"(threshold={thr_aibf/100:.1f}s)",
+        | (
+            (stats["ratio"] > bl["ext_ratio_max"])
+            & (
+                (
+                    stats["train_ratio"].notna()
+                    & (stats["ratio_factor_high"] > bl["ext_ratio_factor_thr"])
+                )
+                | (
+                    stats["train_ratio"].isna()
+                    & (
+                        stats["ratio"]
+                        > bl["ext_ratio_max"] * bl["ext_ratio_factor_thr"]
+                    )
+                )
+            )
         )
-        results.append({"src_ip": ip, "reason": "interval", "value": round(val, 2)})
+    ].copy()
+    for src_ip, row in bad_ratio.sort_values("ratio").iterrows():
+        direction = "low" if row["ratio"] < bl["ext_ratio_min"] else "high"
+        drift = (
+            row["ratio_factor_low"]
+            if direction == "low"
+            else row["ratio_factor_high"]
+        )
+        threshold = (
+            f"ratio outside [{bl['ext_ratio_min']:.6f}, "
+            f"{bl['ext_ratio_max']:.6f}] and own drift>"
+            f"{bl['ext_ratio_factor_thr']:.4f}"
+        )
+        detail = (
+            f"External user {direction} up/down ratio={row['ratio']:.6f}; "
+            f"train_ratio={row['train_ratio']:.6f} drift={drift:.4f}; "
+            f"threshold={threshold}; flows={int(row['flows'])}"
+        )
+        rows.append(
+            {
+                "rule": "R6_ratio",
+                "severity": "MEDIUM",
+                "src_ip": src_ip,
+                "reason": f"ratio_{direction}",
+                "value": float(row["ratio"]),
+                "threshold": threshold,
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R6_ratio", "MEDIUM", src_ip, detail)
 
-    if not results:
+    bad_interval = stats[
+        stats["mean_interval"] > bl["ext_interval_max"]
+    ].copy()
+    for src_ip, row in bad_interval.sort_values(
+        "mean_interval", ascending=False
+    ).iterrows():
+        threshold = f"mean_interval>{bl['ext_interval_max'] / 100:.2f}s"
+        detail = (
+            f"External user abnormal timing mean_interval="
+            f"{row['mean_interval'] / 100:.2f}s; threshold={threshold}; "
+            f"flows={int(row['flows'])}"
+        )
+        rows.append(
+            {
+                "rule": "R6_timing",
+                "severity": "MEDIUM",
+                "src_ip": src_ip,
+                "reason": "timing",
+                "value": float(row["mean_interval"]),
+                "threshold": threshold,
+                "detail": detail,
+            }
+        )
+        if emit:
+            alert("R6_timing", "MEDIUM", src_ip, detail)
+
+    if not rows and emit:
         log.info("  No anomalous external users detected.")
-    return pd.DataFrame(results) if results else pd.DataFrame()
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "rule",
+            "severity",
+            "src_ip",
+            "reason",
+            "value",
+            "threshold",
+            "detail",
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
-# Summary report
+# Orchestration, validation and reports
 # ---------------------------------------------------------------------------
+def run_rules(
+    internal_df: pd.DataFrame,
+    external_df: pd.DataFrame,
+    bl: dict,
+    geodb,
+    geodbasn,
+    emit: bool = True,
+) -> dict[str, pd.DataFrame]:
+    return {
+        "R1": rule_r1_botnet(internal_df, bl, emit=emit),
+        "R2": rule_r2_https_exfiltration(internal_df, bl, emit=emit),
+        "R3": rule_r3_dns_exfiltration(internal_df, bl, emit=emit),
+        "R4": rule_r4_cc_dns(internal_df, bl, emit=emit),
+        "R5": rule_r5_anomalous_destinations(
+            internal_df, bl, geodb, geodbasn, emit=emit
+        ),
+        "R6": rule_r6_anomalous_external_users(external_df, bl, emit=emit),
+    }
 
-def print_summary(
-    r1, r2, r3, r4, r5, r6
-):
-    sep = "=" * 70
+
+def validate_training_baseline(
+    itr: pd.DataFrame,
+    etr: pd.DataFrame,
+    bl: dict,
+    geodb,
+    geodbasn,
+) -> dict[str, pd.DataFrame]:
+    log.info("Validating rules against anomaly-free training data.")
+    results = run_rules(itr, etr, bl, geodb, geodbasn, emit=False)
+    failures = {rule: df for rule, df in results.items() if not df.empty}
+    if failures:
+        for rule, df in failures.items():
+            log.error("  %s produced %d training alerts.", rule, len(df))
+        raise RuntimeError("Training validation failed: rules alerted on clean data.")
+    log.info("  Training validation passed: 0 alerts.")
+    return results
+
+
+def print_summary(results: dict[str, pd.DataFrame]) -> None:
+    sep = "=" * 78
     print(f"\n{sep}")
     print("  UEBA / SIEM ANOMALY DETECTION REPORT")
-    print(f"  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  Generated: {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(sep)
 
-    print("\n--- R1: Internal BotNet (beaconing) ---")
-    if r1.empty:
-        print("  No anomalies detected.")
-    else:
-        for _, row in r1.iterrows():
+    titles = {
+        "R1": "R1: Internal BotNet activity",
+        "R2": "R2: HTTPS Data Exfiltration",
+        "R3": "R3: DNS Data Exfiltration",
+        "R4": "R4: C&C via DNS",
+        "R5": "R5: Anomalous External Destinations",
+        "R6": "R6: Anomalous External Users",
+    }
+    for rule, title in titles.items():
+        df = results[rule]
+        print(f"\n--- {title} ---")
+        if df.empty:
+            print("  No anomalies detected.")
+            continue
+        display_rows = df.drop_duplicates(["rule", "src_ip", "detail"])
+        for row in display_rows.itertuples(index=False):
             print(
-                f"  [ALERT] {row['src_ip']}  →  {row['dst_ip']}"
-                f"  flows={int(row['count'])}  interval={row['mean_interval_s']:.1f}s"
-                f"  CoV={row['cov']:.4f}"
+                f"  [{getattr(row, 'severity')}] {getattr(row, 'rule')} "
+                f"{getattr(row, 'src_ip')} | {getattr(row, 'detail')}"
             )
 
-    print("\n--- R2: HTTPS Data Exfiltration ---")
-    if r2.empty:
-        print("  No anomalies detected.")
-    else:
-        for _, row in r2.iterrows():
-            print(
-                f"  [ALERT] {row['src_ip']}  ratio={row['ratio']:.4f}"
-                f"  up={int(row['up_total']):,}B  down={int(row['dn_total']):,}B"
-            )
-
-    print("\n--- R3: DNS Data Exfiltration ---")
-    if r3.empty:
-        print("  No anomalies detected.")
-    else:
-        for _, row in r3.iterrows():
-            print(f"  [ALERT] {row['src_ip']}  dns_flows={int(row['dns_flows'])}")
-
-    print("\n--- R4: C&C via DNS ---")
-    if r4.empty:
-        print("  No anomalies detected.")
-    else:
-        for _, row in r4.iterrows():
-            print(
-                f"  [ALERT] {row['src_ip']}  dns_flows={int(row['dns_flows'])}"
-                f"  mean_interval={row['mean_interval']/100:.2f}s"
-            )
-
-    print("\n--- R5: Anomalous External Destinations ---")
-    if r5 is None or r5.empty:
-        print("  No anomalies detected.")
-    else:
-        for ip in r5["src_ip"].unique():
-            sub = r5[r5["src_ip"] == ip]
-            cc_list = ", ".join(
-                f"{r['dst_cc']}({int(r['flows'])} flows)" for _, r in sub.iterrows()
-            )
-            print(f"  [ALERT] {ip}  new countries: {cc_list}")
-
-    print("\n--- R6: Anomalous External Users ---")
-    if r6 is None or r6.empty:
-        print("  No anomalies detected.")
-    else:
-        for _, row in r6.iterrows():
-            print(
-                f"  [ALERT] {row['src_ip']}  reason={row['reason']}"
-                f"  value={row['value']}"
-            )
-
-    # Unique flagged IPs
     internal_flagged = set()
-    for df in [r1, r2, r3, r4]:
-        if df is not None and not df.empty:
+    for rule in ["R1", "R2", "R3", "R4", "R5"]:
+        df = results[rule]
+        if not df.empty:
             internal_flagged.update(df["src_ip"].unique())
-    if r5 is not None and not r5.empty:
-        internal_flagged.update(r5["src_ip"].unique())
 
     external_flagged = set()
-    if r6 is not None and not r6.empty:
-        external_flagged.update(r6["src_ip"].unique())
+    if not results["R6"].empty:
+        external_flagged.update(results["R6"]["src_ip"].unique())
 
     print(f"\n{sep}")
     print(f"  Internal anomalous IPs ({len(internal_flagged)}):")
@@ -555,48 +1084,175 @@ def print_summary(
     print(sep)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def result_block(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "_No anomalies detected._"
+    columns = [col for col in ["rule", "severity", "src_ip", "detail"] if col in df]
+    compact = df[columns].drop_duplicates()
+    return "```\n" + compact.to_string(index=False) + "\n```"
 
-def main():
-    log.info("Loading datasets …")
-    itr = pd.read_json(INTERNAL_TRAIN)
-    ite = pd.read_json(INTERNAL_TEST)
-    etr = pd.read_json(EXTERNAL_TRAIN)
-    ete = pd.read_json(EXTERNAL_TEST)
+
+def write_markdown_report(
+    report_path: str | Path,
+    bl: dict,
+    results: dict[str, pd.DataFrame],
+) -> None:
+    path = Path(report_path)
+    lines = [
+        "# UEBA/SIEM anomaly detection report",
+        "",
+        f"Generated: {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "",
+        "## Baselines from clean training data",
+        "",
+        f"- Internal network: `{bl['internal_net']}`",
+        "- Allowed internal services: "
+        + ", ".join(f"`{item}`" for item in bl["allowed_internal_service_labels"]),
+        f"- HTTPS up/down ratio range: `{bl['https_ratio_min']:.6f}` to "
+        f"`{bl['https_ratio_max']:.6f}`; ratio-factor threshold "
+        f"`{bl['https_ratio_factor_thr']:.3f}`",
+        f"- DNS max flows per device: `{bl['dns_flow_max']}`; minimum clean "
+        f"DNS mean interval: `{bl['dns_mean_interval_min'] / 100:.2f}s`",
+        f"- DNS exfiltration threshold: total DNS upload "
+        f"`>{bl['dns_total_up_max']}B` and mean_up "
+        f"`>{bl['dns_mean_up_max']:.2f}B` or up/down "
+        f"`>{bl['dns_ratio_max']:.4f}`",
+        f"- Known destination countries: `{len(bl['train_countries'])}`; "
+        f"new-country high severity threshold: "
+        f"`{bl['country_flow_high_thr']}` flows",
+        f"- External user ratio range: `{bl['ext_ratio_min']:.6f}` to "
+        f"`{bl['ext_ratio_max']:.6f}`; own-drift threshold "
+        f"`{bl['ext_ratio_factor_thr']:.4f}`; max clean interval "
+        f"`{bl['ext_interval_max'] / 100:.2f}s`",
+        "",
+        "## Rule results",
+        "",
+    ]
+    titles = {
+        "R1": "R1 - Internal BotNet activity",
+        "R2": "R2 - HTTPS Data Exfiltration",
+        "R3": "R3 - DNS Data Exfiltration",
+        "R4": "R4 - C&C via DNS",
+        "R5": "R5 - Anomalous External Destinations",
+        "R6": "R6 - Anomalous External Users",
+    }
+    for rule, title in titles.items():
+        lines.extend([f"### {title}", "", result_block(results[rule]), ""])
+
+    internal_flagged = sorted(
+        {
+            ip
+            for rule in ["R1", "R2", "R3", "R4", "R5"]
+            for ip in results[rule]["src_ip"].unique()
+        }
+    )
+    external_flagged = (
+        sorted(results["R6"]["src_ip"].unique()) if not results["R6"].empty else []
+    )
+    lines.extend(
+        [
+            "## Final anomalous IP lists",
+            "",
+            "Internal: " + (", ".join(f"`{ip}`" for ip in internal_flagged) or "none"),
+            "",
+            "External: " + (", ".join(f"`{ip}`" for ip in external_flagged) or "none"),
+            "",
+        ]
+    )
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    log.info("Markdown report written to %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="UEBA/SIEM anomaly detector")
+    parser.add_argument("--internal-train", default=INTERNAL_TRAIN)
+    parser.add_argument("--internal-test", default=INTERNAL_TEST)
+    parser.add_argument("--external-train", default=EXTERNAL_TRAIN)
+    parser.add_argument("--external-test", default=EXTERNAL_TEST)
+    parser.add_argument("--geodb-country", default=GEODB_COUNTRY)
+    parser.add_argument("--geodb-asn", default=GEODB_ASN)
+    parser.add_argument(
+        "--syslog-host",
+        default=None,
+        help="Optional remote SIEM/Wazuh syslog host.",
+    )
+    parser.add_argument(
+        "--syslog-port",
+        type=int,
+        default=514,
+        help="Remote SIEM/Wazuh syslog UDP port.",
+    )
+    parser.add_argument(
+        "--no-local-syslog",
+        action="store_true",
+        help="Do not also send alerts to /dev/log when available.",
+    )
+    parser.add_argument(
+        "--skip-train-validation",
+        action="store_true",
+        help="Skip the zero-alert validation on training data.",
+    )
+    parser.add_argument(
+        "--report",
+        default="ueba_siem_report.md",
+        help="Markdown report path.",
+    )
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Do not write a Markdown report.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    configure_syslog(
+        syslog_host=args.syslog_host,
+        syslog_port=args.syslog_port,
+        enable_local=not args.no_local_syslog,
+    )
+
+    log.info("Loading datasets.")
+    itr = pd.read_json(args.internal_train)
+    ite = pd.read_json(args.internal_test)
+    etr = pd.read_json(args.external_train)
+    ete = pd.read_json(args.external_test)
 
     log.info(
-        "  internal_train=%d rows  internal_test=%d rows",
-        len(itr), len(ite),
+        "  internal_train=%d rows internal_test=%d rows",
+        len(itr),
+        len(ite),
     )
     log.info(
-        "  external_train=%d rows  external_test=%d rows",
-        len(etr), len(ete),
+        "  external_train=%d rows external_test=%d rows",
+        len(etr),
+        len(ete),
     )
 
-    geodb    = geoip2.database.Reader(GEODB_COUNTRY)
-    geodbasn = geoip2.database.Reader(GEODB_ASN)
+    geodb = geoip2.database.Reader(args.geodb_country)
+    geodbasn = geoip2.database.Reader(args.geodb_asn)
 
-    bl = compute_baselines(itr, etr, geodb)
+    try:
+        bl = compute_baselines(itr, etr, geodb, geodbasn)
+        if not args.skip_train_validation:
+            validate_training_baseline(itr, etr, bl, geodb, geodbasn)
 
-    log.info("\nApplying UEBA rules to test datasets …\n")
-    r1 = rule_r1_botnet_beaconing(ite, bl)
-    r2 = rule_r2_https_exfiltration(ite, bl)
-    r3 = rule_r3_dns_exfiltration(ite, bl)
-    r4 = rule_r4_cc_dns(ite, bl)
-    r5 = rule_r5_anomalous_destinations(ite, bl, geodb)
-    r6 = rule_r6_anomalous_external_users(ete, bl)
+        log.info("Applying UEBA rules to test datasets.")
+        results = run_rules(ite, ete, bl, geodb, geodbasn, emit=True)
+        print_summary(results)
 
-    print_summary(r1, r2, r3, r4, r5, r6)
+        if not args.no_report:
+            write_markdown_report(args.report, bl, results)
 
-    geodb.close()
-    geodbasn.close()
-
-    if SYSLOG_AVAILABLE:
-        log.info("Alerts also forwarded to rsyslog (/dev/log).")
-    else:
-        log.info("rsyslog not available (running without /dev/log).")
+        if SYSLOG_TARGETS:
+            log.info("Alerts forwarded to syslog targets: %s", ", ".join(SYSLOG_TARGETS))
+        else:
+            log.info("No syslog target configured; alerts were printed to console.")
+    finally:
+        geodb.close()
+        geodbasn.close()
 
 
 if __name__ == "__main__":
