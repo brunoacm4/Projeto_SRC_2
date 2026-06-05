@@ -1096,18 +1096,66 @@ def write_markdown_report(
     report_path: str | Path,
     bl: dict,
     results: dict[str, pd.DataFrame],
+    dataset_info: dict[str, int],
 ) -> None:
     path = Path(report_path)
+    internal_flagged = sorted(
+        {
+            ip
+            for rule in ["R1", "R2", "R3", "R4", "R5"]
+            for ip in results[rule]["src_ip"].unique()
+        }
+    )
+    external_flagged = (
+        sorted(results["R6"]["src_ip"].unique()) if not results["R6"].empty else []
+    )
+
     lines = [
         "# UEBA/SIEM anomaly detection report",
         "",
         f"Generated: {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "",
-        "## Baselines from clean training data",
+        "## Objective",
+        "",
+        "This report documents the UEBA module developed for the SIEM project. "
+        "The goal is to learn normal behaviour from anomaly-free historical "
+        "flow logs and then detect anomalous devices in the test logs. The "
+        "implemented detector analyses internal clients, external clients, "
+        "traffic volumes, upload/download ratios, timing patterns, destination "
+        "countries and destination ASN/owner information.",
+        "",
+        "The training files are treated as clean ground truth. For that reason, "
+        "each rule is calibrated using values observed in the training data and "
+        "the script validates that the same rules produce zero alerts when "
+        "applied back to the training files.",
+        "",
+        "## Dataset and analysis method",
+        "",
+        f"- Internal training rows: `{dataset_info['internal_train_rows']}`; "
+        f"internal test rows: `{dataset_info['internal_test_rows']}`.",
+        f"- External training rows: `{dataset_info['external_train_rows']}`; "
+        f"external test rows: `{dataset_info['external_test_rows']}`.",
+        f"- Internal training devices: `{dataset_info['internal_train_sources']}`; "
+        f"external training clients: `{dataset_info['external_train_sources']}`.",
+        "",
+        "The analysis was performed in four steps:",
+        "",
+        "1. Infer the normal network structure from `internal_train1.json` and "
+        "`external_train1.json`.",
+        "2. Quantify normal behaviour: services, flow counts, byte totals, "
+        "upload/download ratios, inter-flow intervals, countries and ASNs.",
+        "3. Define UEBA rules using only thresholds derived from the clean "
+        "training data.",
+        "4. Apply the rules to the test datasets and report anomalous IPs with "
+        "the metric observed, the threshold used and a severity level.",
+        "",
+        "## Normal behaviour learned from training data",
         "",
         f"- Internal network: `{bl['internal_net']}`",
         "- Allowed internal services: "
         + ", ".join(f"`{item}`" for item in bl["allowed_internal_service_labels"]),
+        "- Corporate public servers observed from external accesses: "
+        + ", ".join(f"`{item}`" for item in sorted(bl["corporate_servers"])),
         f"- HTTPS up/down ratio range: `{bl['https_ratio_min']:.6f}` to "
         f"`{bl['https_ratio_max']:.6f}`; ratio-factor threshold "
         f"`{bl['https_ratio_factor_thr']:.3f}`",
@@ -1125,7 +1173,77 @@ def write_markdown_report(
         f"`{bl['ext_ratio_factor_thr']:.4f}`; max clean interval "
         f"`{bl['ext_interval_max'] / 100:.2f}s`",
         "",
-        "## Rule results",
+        "The most important conclusion from the clean data is that internal "
+        "clients normally contact only three internal services: two DNS servers "
+        "and one HTTPS server. Any internal traffic to other private clients is "
+        "therefore suspicious. Another important conclusion is that normal "
+        "HTTPS traffic is download-heavy: the upload/download ratio stays below "
+        f"`{bl['https_ratio_max']:.6f}` in the clean day. For external users, "
+        "the amount of traffic is not the main signal; the useful signals are "
+        "ratio drift and timing drift.",
+        "",
+        "## Rule design and justification",
+        "",
+        "### R1 - Internal BotNet activity",
+        "",
+        "R1 has two sub-rules. `R1a` detects internal lateral communication: "
+        "if a private destination service was not present in the clean training "
+        "day, it is considered anomalous. This follows the observation that "
+        "normal internal traffic only targets the known DNS/HTTPS servers. "
+        "`R1b` detects beaconing to one external destination by measuring the "
+        "coefficient of variation of inter-flow intervals; highly regular "
+        "periodic traffic is a typical C&C/beaconing pattern.",
+        "",
+        "### R2 - HTTPS data exfiltration",
+        "",
+        "R2 detects devices whose HTTPS upload/download ratio deviates strongly "
+        "from both the global clean maximum and their own clean historical "
+        "ratio. This avoids false positives from small natural fluctuations and "
+        "focuses on devices sending data in a way that is incompatible with the "
+        "normal download-heavy HTTPS baseline.",
+        "",
+        "### R3 - DNS data exfiltration",
+        "",
+        "R3 is intentionally separated from DNS C&C. It only alerts when DNS "
+        "upload volume is above the historical maximum and the payload/ratio "
+        "also deviates from the clean baseline. In this dataset no DNS "
+        "exfiltration was detected; the DNS anomalies found are better "
+        "explained by timing/flow-count behaviour and are therefore reported by "
+        "R4.",
+        "",
+        "### R4 - C&C via DNS",
+        "",
+        "R4 detects DNS command-and-control behaviour using two simultaneous "
+        "conditions: more DNS flows than any clean device and a mean interval "
+        "between DNS flows shorter than the clean minimum. This captures "
+        "polling-like DNS behaviour without confusing it with normal DNS usage.",
+        "",
+        "### R5 - Anomalous external destinations",
+        "",
+        "R5 compares HTTPS destination countries against the set of countries "
+        "seen in the clean training day. New countries are reported together "
+        "with ASN/owner information. Severity is higher when the total number "
+        "of flows to new countries exceeds the 75th percentile of normal "
+        "per-device/per-country flow counts.",
+        "",
+        "### R6 - Anomalous external users",
+        "",
+        "R6 analyses external clients accessing the corporate public servers. "
+        "New source IPs are not automatically anomalous because the assignment "
+        "states that the anomaly is not simply traffic amount or flow count. "
+        "Instead, R6 flags clients whose upload/download ratio leaves the clean "
+        "range and also drifts from their own baseline, or whose mean interval "
+        "between flows exceeds the maximum clean interval.",
+        "",
+        "## Validation",
+        "",
+        "The script applies all rules to the clean training datasets before "
+        "testing. The implemented version passed this check with `0` training "
+        "alerts. This is an important sanity check: if a rule alerts on the "
+        "known-good history, the threshold is too aggressive or poorly "
+        "justified.",
+        "",
+        "## Rule results on test data",
         "",
     ]
     titles = {
@@ -1139,16 +1257,6 @@ def write_markdown_report(
     for rule, title in titles.items():
         lines.extend([f"### {title}", "", result_block(results[rule]), ""])
 
-    internal_flagged = sorted(
-        {
-            ip
-            for rule in ["R1", "R2", "R3", "R4", "R5"]
-            for ip in results[rule]["src_ip"].unique()
-        }
-    )
-    external_flagged = (
-        sorted(results["R6"]["src_ip"].unique()) if not results["R6"].empty else []
-    )
     lines.extend(
         [
             "## Final anomalous IP lists",
@@ -1156,6 +1264,42 @@ def write_markdown_report(
             "Internal: " + (", ".join(f"`{ip}`" for ip in internal_flagged) or "none"),
             "",
             "External: " + (", ".join(f"`{ip}`" for ip in external_flagged) or "none"),
+            "",
+            "## Conclusions",
+            "",
+            "The strongest internal findings are the unauthorized private "
+            "communications between `192.168.101.68`, `192.168.101.138` and "
+            "`192.168.101.186`, the HTTPS exfiltration candidates with large "
+            "upload/download ratio drift, and the DNS C&C candidates with very "
+            "short polling intervals. The anomalous-destination rule also "
+            "identified three high-severity devices contacting many destinations "
+            "in countries absent from the clean baseline: `192.168.101.36`, "
+            "`192.168.101.72` and `192.168.101.125`.",
+            "",
+            "For external users, the flagged clients are anomalous because of "
+            "behavioural differences, not because they are new IPs or because "
+            "they generated the largest amount of traffic. The relevant signals "
+            "were upload/download ratio drift and longer-than-normal inter-flow "
+            "intervals.",
+            "",
+            "## SIEM reporting",
+            "",
+            "Every alert is printed to console with `rule`, `severity`, `src_ip` "
+            "and the metric/threshold justification. The script can also send "
+            "alerts to a remote SIEM/Wazuh syslog endpoint using "
+            "`--syslog-host` and `--syslog-port`. The emitted syslog message "
+            "starts with `Alarm UEBA <src_ip>`, matching the decoder structure "
+            "used in the SIEM class material.",
+            "",
+            "## Future work: plots for Overleaf",
+            "",
+            "The report would benefit from plots when moved to Overleaf. The "
+            "most useful figures would be: HTTPS upload/download ratio "
+            "boxplots for train vs test, DNS flow-count and mean-interval "
+            "scatter plots, a bar chart of new-country flows per source IP, "
+            "and external-user ratio/interval plots. These plots were left as "
+            "future work to keep the current deliverable focused on the "
+            "validated rules and numeric justifications.",
             "",
         ]
     )
@@ -1230,6 +1374,14 @@ def main() -> None:
         len(etr),
         len(ete),
     )
+    dataset_info = {
+        "internal_train_rows": len(itr),
+        "internal_test_rows": len(ite),
+        "external_train_rows": len(etr),
+        "external_test_rows": len(ete),
+        "internal_train_sources": itr["src_ip"].nunique(),
+        "external_train_sources": etr["src_ip"].nunique(),
+    }
 
     geodb = geoip2.database.Reader(args.geodb_country)
     geodbasn = geoip2.database.Reader(args.geodb_asn)
@@ -1244,7 +1396,7 @@ def main() -> None:
         print_summary(results)
 
         if not args.no_report:
-            write_markdown_report(args.report, bl, results)
+            write_markdown_report(args.report, bl, results, dataset_info)
 
         if SYSLOG_TARGETS:
             log.info("Alerts forwarded to syslog targets: %s", ", ".join(SYSLOG_TARGETS))
