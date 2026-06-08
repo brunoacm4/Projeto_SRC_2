@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp") / "ueba_siem_matplotlib"))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -92,7 +95,7 @@ def plot_internal_services(itr, ite, bl):
     unexpected["pair"] = unexpected["src_ip"] + " -> " + unexpected["dst_ip"]
     unexpected_counts = unexpected["pair"].value_counts().sort_values()
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    fig, axes = plt.subplots(2, 1, figsize=(9.0, 7.2), constrained_layout=True)
     normal_counts.plot(kind="barh", ax=axes[0], color=BLUE)
     axes[0].set_title("Clean internal services")
     axes[0].set_xlabel("flows in internal_train")
@@ -111,11 +114,11 @@ def plot_https_ratios(itr, ite, bl, results):
     test = ueba.https_stats(ite)
     r2_ips = set(results["R2"]["src_ip"]) if not results["R2"].empty else set()
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    fig, axes = plt.subplots(2, 1, figsize=(9.0, 7.4), constrained_layout=True)
 
     axes[0].boxplot(
         [train["ratio"].dropna(), test["ratio"].dropna()],
-        labels=["train", "test"],
+        tick_labels=["train", "test"],
         showfliers=False,
         patch_artist=True,
         boxprops={"facecolor": "#dbeafe", "edgecolor": BLUE},
@@ -227,7 +230,7 @@ def plot_external_users(etr, ete, bl, results):
     ratio_ips = set(r6.loc[r6["rule"] == "R6_ratio", "src_ip"]) if not r6.empty else set()
     timing_ips = set(r6.loc[r6["rule"] == "R6_timing", "src_ip"]) if not r6.empty else set()
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    fig, axes = plt.subplots(2, 1, figsize=(9.0, 7.4), constrained_layout=True)
     axes[0].scatter(range(len(train)), train["ratio"].sort_values(), color=BLUE, alpha=0.45, label="train")
     test_sorted = test["ratio"].sort_values()
     point_colors = [RED if ip in ratio_ips else GRAY for ip in test_sorted.index]
